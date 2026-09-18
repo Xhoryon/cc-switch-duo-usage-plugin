@@ -67,7 +67,7 @@ jobs:
           shasum -a 256 "$app_zip" "$dmg_asset" "$source_zip"
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: CC Switch Usage Plugin ${{ github.ref_name }}
           body_path: docs/release-notes/v1.0.1.md

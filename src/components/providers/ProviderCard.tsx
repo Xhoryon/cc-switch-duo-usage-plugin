@@ -14,6 +14,8 @@ import type {
 import type { OpenClawProviderConfig, Provider } from "@/types";
 import type { AppId } from "@/lib/api";
 import { authApi } from "@/lib/api";
+import { UsageLimitDialog } from "@/components/usage-limit/UsageLimitDialog";
+import { useUsageLimitStatus } from "@/lib/query/usageLimit";
 import { cn } from "@/lib/utils";
 import { ProviderActions } from "@/components/providers/ProviderActions";
 import { ProviderIcon } from "@/components/ProviderIcon";
@@ -328,6 +330,11 @@ export function ProviderCard({
     usage?.success && usage.data && usage.data.length > 1 && !isTokenPlan;
 
   const [isExpanded, setIsExpanded] = useState(false);
+
+  // 使用限额：Dialog 开关 + 状态（仅代理类应用启用，非代理应用 null）
+  const [isLimitDialogOpen, setIsLimitDialogOpen] = useState(false);
+  const limitStatus = useUsageLimitStatus(provider.id, appId);
+  const limitEnabled = isProxyAppId(appId);
 
   useEffect(() => {
     if (hasMultiplePlans) {
@@ -684,6 +691,7 @@ export function ProviderCard({
           <div className="flex items-center gap-1.5 flex-shrink-0 opacity-0 pointer-events-none group-hover:opacity-100 group-focus-within:opacity-100 group-hover:pointer-events-auto group-focus-within:pointer-events-auto transition-opacity duration-200">
             <ProviderActions
               appId={appId}
+              providerId={provider.id}
               isCurrent={isCurrent}
               isInConfig={isInConfig}
               isTesting={isTesting}
@@ -711,6 +719,9 @@ export function ProviderCard({
                 isXaiOauth
                   ? undefined
                   : () => onConfigureUsage(provider)
+              }
+              onConfigureLimit={
+                limitEnabled ? () => setIsLimitDialogOpen(true) : undefined
               }
               onDelete={() => onDelete(provider)}
               onRemoveFromConfig={
@@ -750,6 +761,16 @@ export function ProviderCard({
             inline={false}
           />
         </div>
+      )}
+
+      {limitEnabled && (
+        <UsageLimitDialog
+          provider={provider}
+          appId={appId}
+          isOpen={isLimitDialogOpen}
+          status={limitStatus.data}
+          onClose={() => setIsLimitDialogOpen(false)}
+        />
       )}
     </div>
   );

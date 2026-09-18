@@ -25,6 +25,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { AppId } from "@/lib/api";
 import { isAdditiveAppId } from "@/config/appConfig";
+import { UsageLimitButton } from "@/components/usage-limit/UsageLimitButton";
 
 interface OpenClawDefaultModelOption {
   id: string;
@@ -33,6 +34,8 @@ interface OpenClawDefaultModelOption {
 
 interface ProviderActionsProps {
   appId?: AppId;
+  /** Provider id：使用限额图标用它拉取状态 */
+  providerId?: string;
   isCurrent: boolean;
   isInConfig?: boolean;
   isTesting?: boolean;
@@ -43,6 +46,8 @@ interface ProviderActionsProps {
   onDuplicate?: () => void;
   onTest?: () => void;
   onConfigureUsage?: () => void;
+  /** 打开「使用限额」Dialog（仅代理类应用传入） */
+  onConfigureLimit?: () => void;
   onDelete: () => void;
   onRemoveFromConfig?: () => void;
   onDisableOmo?: () => void;
@@ -75,6 +80,7 @@ interface MainButtonState {
 
 export function ProviderActions({
   appId,
+  providerId,
   isCurrent,
   isInConfig = false,
   isTesting,
@@ -85,6 +91,7 @@ export function ProviderActions({
   onDuplicate,
   onTest,
   onConfigureUsage,
+  onConfigureLimit,
   onDelete,
   onRemoveFromConfig,
   onDisableOmo,
@@ -443,6 +450,14 @@ export function ProviderActions({
         >
           <BarChart3 className="h-4 w-4" />
         </Button>
+
+        {onConfigureLimit && (
+          <UsageLimitButton
+            providerId={providerId ?? ""}
+            appId={appId ?? "claude"}
+            onOpen={onConfigureLimit}
+          />
+        )}
 
         {onOpenTerminal && (
           <Button

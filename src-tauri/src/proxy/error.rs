@@ -74,6 +74,22 @@ pub enum ProxyError {
     #[error("认证失败: {0}")]
     AuthError(String),
 
+    /// API Key 使用限额已达到：转发前被 Budget Guard 拦截。
+    /// 携带结构化明细（provider/used/limit），错误体 type = cc_switch_usage_limit。
+    #[error("{message}")]
+    BudgetExhausted {
+        message: String,
+        detail: serde_json::Value,
+    },
+
+    /// The selected upstream reported a hard quota/billing limit. This is a
+    /// terminal budget error, never a network failure eligible for failover.
+    #[error("上游使用限额已达到")]
+    UpstreamBudgetExhausted {
+        status: u16,
+        detail: serde_json::Value,
+    },
+
     #[allow(dead_code)]
     #[error("内部错误: {0}")]
     Internal(String),
@@ -113,6 +129,34 @@ impl IntoResponse for ProxyError {
                 };
 
                 (http_status, error_body)
+            }
+            ProxyError::BudgetExhausted { message, detail } => {
+                // 限额拒绝：429 + 结构化错误体（与既有 {"error": {...}} 约定一致），
+                // 让 CLI 客户端能看到「为什么被拒」与当前用量/上限。
+                let mut error_obj = serde_json::Map::new();
+                error_obj.insert("message".to_string(), json!(message));
+                error_obj.insert("type".to_string(), json!("cc_switch_usage_limit"));
+                if let Some(detail_obj) = detail.as_object() {
+                    for (key, value) in detail_obj {
+                        error_obj.insert(key.clone(), value.clone());
+                    }
+                }
+                (StatusCode::TOO_MANY_REQUESTS, json!({ "error": error_obj }))
+            }
+            ProxyError::UpstreamBudgetExhausted { status, detail } => {
+                let mut error_obj = serde_json::Map::new();
+                error_obj.insert(
+                    "message".to_string(),
+                    json!("Blocked by upstream usage limit"),
+                );
+                error_obj.insert("type".to_string(), json!("upstream_usage_limit_reached"));
+                if let Some(detail_obj) = detail.as_object() {
+                    for (key, value) in detail_obj {
+                        error_obj.insert(key.clone(), value.clone());
+                    }
+                }
+                error_obj.insert("upstream_status".to_string(), json!(status));
+                (StatusCode::TOO_MANY_REQUESTS, json!({ "error": error_obj }))
             }
             _ => {
                 let (http_status, message) = match &self {
@@ -162,7 +206,11 @@ impl IntoResponse for ProxyError {
                     ProxyError::ResponseBodyTooLarge(_) => {
                         (StatusCode::BAD_GATEWAY, self.to_string())
                     }
-                    ProxyError::UpstreamError { .. } => unreachable!(),
+                    ProxyError::UpstreamError { .. }
+                    | ProxyError::BudgetExhausted { .. }
+                    | ProxyError::UpstreamBudgetExhausted { .. } => {
+                        unreachable!()
+                    }
                 };
 
                 let error_body = json!({
@@ -191,6 +239,42 @@ pub enum ErrorCategory {
     ClientAbort, // 客户端主动中断
 }
 
+/// Detect a hard upstream quota/billing response without treating every 429
+/// rate-limit response as a permanent budget exhaustion. The returned detail
+/// is deliberately small and contains no upstream body or credential data.
+pub fn upstream_budget_detail(status: u16, body: Option<&str>) -> Option<serde_json::Value> {
+    let normalized = body
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .replace(['_', '-'], " ");
+    let budget_signal = [
+        "quota",
+        "insufficient credits",
+        "insufficient quota",
+        "billing",
+        "usage limit",
+        "monthly limit",
+        "spend limit",
+        "credit limit",
+        "limit reached",
+        "api key limit reached",
+        "cc switch usage limit",
+        "quota exceeded",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    let hard_status = status == 402 || (status == 403 && budget_signal);
+    if !(hard_status || (status == 429 && budget_signal)) {
+        return None;
+    }
+
+    Some(json!({
+        "code": "UPSTREAM_API_KEY_LIMIT_REACHED",
+        "source": "upstream",
+        "budget_signal": budget_signal,
+    }))
+}
+
 /// 判断错误是否可重试
 #[allow(dead_code)]
 pub fn categorize_error(error: &reqwest::Error) -> ErrorCategory {
@@ -208,5 +292,41 @@ pub fn categorize_error(error: &reqwest::Error) -> ErrorCategory {
         }
     } else {
         ErrorCategory::Retryable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{upstream_budget_detail, ErrorCategory, ProxyError};
+
+    #[test]
+    fn upstream_quota_is_detected_without_copying_body() {
+        let detail = upstream_budget_detail(
+            429,
+            Some(r#"{"error":{"message":"monthly quota exceeded for sk-secret"}}"#),
+        )
+        .expect("quota response should be detected");
+        assert_eq!(detail["code"], "UPSTREAM_API_KEY_LIMIT_REACHED");
+        assert!(!detail.to_string().contains("sk-secret"));
+    }
+
+    #[test]
+    fn ordinary_rate_limit_is_not_upstream_budget_exhaustion() {
+        assert!(upstream_budget_detail(429, Some("retry after 30 seconds")).is_none());
+    }
+
+    #[test]
+    fn upstream_budget_is_a_terminal_category() {
+        let error = ProxyError::UpstreamBudgetExhausted {
+            status: 429,
+            detail: serde_json::json!({"code": "UPSTREAM_API_KEY_LIMIT_REACHED"}),
+        };
+        assert_eq!(
+            super::ErrorCategory::NonRetryable,
+            match error {
+                ProxyError::UpstreamBudgetExhausted { .. } => ErrorCategory::NonRetryable,
+                _ => ErrorCategory::Retryable,
+            }
+        );
     }
 }

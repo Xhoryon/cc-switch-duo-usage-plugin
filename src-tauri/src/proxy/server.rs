@@ -454,6 +454,306 @@ mod tests {
         body: Value,
     }
 
+    #[tokio::test]
+    async fn two_switch_http_chain_shares_key_identity_but_keeps_local_ledgers() {
+        let captured = Arc::new(Mutex::new(0usize));
+        let mock_app = Router::new().route(
+            "/v1/messages",
+            post({
+                let captured = captured.clone();
+                move |request: axum::extract::Request| {
+                    let captured = captured.clone();
+                    async move {
+                        let (_parts, _body) = request.into_parts();
+                        *captured.lock().await += 1;
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"id":"msg-duo-1","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":4,"output_tokens":6}}"#,
+                        )
+                    }
+                }
+            }),
+        );
+        let mock_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind mock provider");
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let mock_handle = tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app)
+                .await
+                .expect("serve mock provider");
+        });
+
+        let key = "sk-duo-same-key";
+        let fingerprint = crate::services::usage_limit::credential_fingerprint("claude", key);
+        let db1 = Arc::new(Database::memory().unwrap());
+        let provider1 = Provider::with_id(
+            "switch-1-provider".to_string(),
+            "Switch 1 Provider".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": format!("http://{mock_addr}"),
+                    "ANTHROPIC_AUTH_TOKEN": key
+                }
+            }),
+            None,
+        );
+        db1.save_provider("claude", &provider1).unwrap();
+        db1.set_current_provider("claude", &provider1.id).unwrap();
+        db1.upsert_api_key_limit(&crate::database::ApiKeyLimitRow {
+            provider_id: provider1.id.clone(),
+            app_type: "claude".to_string(),
+            credential_fingerprint: fingerprint.clone(),
+            enabled: true,
+            limit_type: "token".to_string(),
+            currency: None,
+            limit_amount: "5000".to_string(),
+            usage_start_at: 0,
+            reset_interval_seconds: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+
+        let switch1 = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                enable_logging: true,
+                non_streaming_timeout: 10,
+                ..ProxyConfig::default()
+            },
+            db1.clone(),
+            None,
+        );
+        let switch1_info = switch1.start().await.unwrap();
+        let health = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{}/health", switch1_info.port))
+            .send()
+            .await
+            .expect("switch1 health request failed");
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let db2 = Arc::new(Database::memory().unwrap());
+        let provider2 = Provider::with_id(
+            "switch-2-provider".to_string(),
+            "Switch 2 Provider".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{}", switch1_info.port),
+                    "ANTHROPIC_AUTH_TOKEN": key
+                }
+            }),
+            None,
+        );
+        db2.save_provider("claude", &provider2).unwrap();
+        db2.set_current_provider("claude", &provider2.id).unwrap();
+        db2.upsert_api_key_limit(&crate::database::ApiKeyLimitRow {
+            provider_id: provider2.id.clone(),
+            app_type: "claude".to_string(),
+            credential_fingerprint: fingerprint.clone(),
+            enabled: true,
+            limit_type: "token".to_string(),
+            currency: None,
+            limit_amount: "1".to_string(),
+            usage_start_at: 0,
+            reset_interval_seconds: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+        let switch2 = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                enable_logging: true,
+                non_streaming_timeout: 10,
+                ..ProxyConfig::default()
+            },
+            db2.clone(),
+            None,
+        );
+        let switch2_info = switch2.start().await.unwrap();
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        // Downstream has the lower local limit, so the request must stop at
+        // Switch 2 and never reach Switch 1 or the mock provider.
+        let downstream_blocked = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/messages",
+                    switch2_info.port
+                ))
+                .header(header::AUTHORIZATION, "Bearer client-secret")
+                .json(&json!({
+                    "model": "claude-test",
+                    "max_tokens": 20,
+                    "messages": [{"role": "user", "content": "downstream-blocked"}]
+                }))
+                .send(),
+        )
+        .await
+        .expect("downstream blocked request timed out")
+        .unwrap();
+        assert_eq!(downstream_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(*captured.lock().await, 0);
+
+        // Raise Switch 2 for the normal pass-through request. Switch 1 keeps
+        // the higher limit, so both local ledgers can record this request.
+        db2.upsert_api_key_limit(&crate::database::ApiKeyLimitRow {
+            provider_id: provider2.id.clone(),
+            app_type: "claude".to_string(),
+            credential_fingerprint: fingerprint.clone(),
+            enabled: true,
+            limit_type: "token".to_string(),
+            currency: None,
+            limit_amount: "1000".to_string(),
+            usage_start_at: 0,
+            reset_interval_seconds: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/messages",
+                    switch2_info.port
+                ))
+                .header(header::AUTHORIZATION, "Bearer client-secret")
+                .json(&json!({
+                    "model": "claude-test",
+                    "max_tokens": 20,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }))
+                .send(),
+        )
+        .await
+        .expect("initial duo request timed out")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let ledger_wait = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let counts = {
+                    let c1 = db1.conn.lock().unwrap();
+                    let c2 = db2.conn.lock().unwrap();
+                    let n1: i64 = c1
+                        .query_row(
+                            "SELECT COUNT(*) FROM proxy_request_logs
+                             WHERE data_source = 'proxy' AND status_code = 200",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let n2: i64 = c2
+                        .query_row(
+                            "SELECT COUNT(*) FROM proxy_request_logs
+                             WHERE data_source = 'proxy' AND status_code = 200",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    (n1, n2)
+                };
+                if counts == (1, 1) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if ledger_wait.is_err() {
+            let counts = {
+                let c1 = db1.conn.lock().unwrap();
+                let c2 = db2.conn.lock().unwrap();
+                let n1: i64 = c1
+                    .query_row(
+                        "SELECT COUNT(*) FROM proxy_request_logs
+                         WHERE data_source = 'proxy' AND status_code = 200",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let n2: i64 = c2
+                    .query_row(
+                        "SELECT COUNT(*) FROM proxy_request_logs
+                         WHERE data_source = 'proxy' AND status_code = 200",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                (n1, n2)
+            };
+            panic!("both switches should record local proxy usage, got {counts:?}");
+        }
+
+        let stored_fp = |db: &Database, provider_id: &str| {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT credential_fingerprint FROM proxy_request_logs
+                 WHERE provider_id = ?1 AND status_code = 200",
+                [provider_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stored_fp(&db1, &provider1.id), fingerprint);
+        assert_eq!(stored_fp(&db2, &provider2.id), fingerprint);
+        assert_eq!(*captured.lock().await, 1);
+
+        // Lower Switch 1's local limit. Switch 2 may pass its own gate, but
+        // the upstream CC Switch quota response must stop the chain rather
+        // than be retried/bypassed.
+        db1.upsert_api_key_limit(&crate::database::ApiKeyLimitRow {
+            provider_id: provider1.id.clone(),
+            app_type: "claude".to_string(),
+            credential_fingerprint: fingerprint,
+            enabled: true,
+            limit_type: "token".to_string(),
+            currency: None,
+            limit_amount: "1".to_string(),
+            usage_start_at: 0,
+            reset_interval_seconds: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/messages",
+                    switch2_info.port
+                ))
+                .header(header::AUTHORIZATION, "Bearer client-secret")
+                .json(&json!({
+                    "model": "claude-test",
+                    "max_tokens": 20,
+                    "messages": [{"role": "user", "content": "blocked"}]
+                }))
+                .send(),
+        )
+        .await
+        .expect("blocked duo request timed out")
+        .unwrap();
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        let blocked_body: Value = blocked.json().await.unwrap();
+        assert_eq!(
+            blocked_body["error"]["type"],
+            "upstream_usage_limit_reached"
+        );
+        assert_eq!(*captured.lock().await, 1);
+
+        switch2.stop().await.unwrap();
+        switch1.stop().await.unwrap();
+        mock_handle.abort();
+    }
+
     /// A base URL pasted as a complete endpoint with the full-URL switch left off
     /// must derive the sibling standalone endpoint instead of having the
     /// standalone path appended to it.

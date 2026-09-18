@@ -23,8 +23,10 @@ use super::{
     ProxyError,
 };
 use crate::commands::{CodexOAuthState, CopilotAuthState, XaiOAuthState};
+use crate::database::Database;
 use crate::proxy::providers::copilot_auth::CopilotAuthManager;
 use crate::proxy::providers::xai_oauth_auth::XaiOAuthManager;
+use crate::services::usage_limit::BudgetReservation;
 use crate::{
     app_config::AppType,
     provider::{LocalProxyRequestOverrides, Provider},
@@ -32,7 +34,7 @@ use crate::{
 use bytes::Bytes;
 use futures::StreamExt;
 use http::Extensions;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
@@ -107,9 +109,50 @@ pub struct ForwardResult {
     /// usage 归因不能依赖 ctx.request_model（映射前的客户端别名）：上游响应
     /// 缺失 model 或回显别名时，接管流量会被记成 claude-* 并按其定价计费。
     pub outbound_model: Option<String>,
+    /// 实际使用的 API Key 指纹（不可逆 SHA-256，与 Budget Guard / 使用限额
+    /// 绑定同一身份）。OAuth 类 provider 或无静态 key 时为 None。
+    /// usage 落库时随行写入 proxy_request_logs.credential_fingerprint。
+    pub credential_fingerprint: Option<String>,
+    /// Local budget reservation held until response processing reconciles the
+    /// authoritative usage (or releases it on an aborted/error response).
+    pub budget_reservation: Option<BudgetReservation>,
     /// 活跃连接 RAII guard：随响应一起流转到 response_processor / handle_claude_transform，
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
+}
+
+/// Keeps a pending reservation alive while a provider attempt is in flight.
+/// If the attempt fails or never produces a response, dropping this guard
+/// releases the reservation before failover proceeds.
+struct BudgetReservationGuard {
+    db: Arc<Database>,
+    reservation: Option<BudgetReservation>,
+}
+
+impl BudgetReservationGuard {
+    fn new(db: Arc<Database>, reservation: BudgetReservation) -> Self {
+        Self {
+            db,
+            reservation: Some(reservation),
+        }
+    }
+
+    fn into_reservation(mut self) -> Option<BudgetReservation> {
+        self.reservation.take()
+    }
+}
+
+impl Drop for BudgetReservationGuard {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            if let Err(error) = self.db.release_budget_reservation(&reservation.request_id) {
+                log::warn!(
+                    "[Budget] 释放失败的 request reservation 失败: request_id={}, error={error}",
+                    reservation.request_id
+                );
+            }
+        }
+    }
 }
 
 pub struct ForwardError {
@@ -188,6 +231,8 @@ pub struct RequestForwarder {
     /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
     /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    /// Opaque id shared by all attempts of one client request.
+    budget_request_id: String,
 }
 
 impl RequestForwarder {
@@ -278,6 +323,7 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            budget_request_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -495,6 +541,74 @@ impl RequestForwarder {
                 continue;
             }
 
+            // [Budget] 转发前建立本地 reservation：它把已提交用量和并发中
+            // 的请求一起纳入闸门，避免两个请求同时看到同一份剩余额度。
+            // failover 链上的 reservation 只绑定当前 provider；本次尝试失败
+            // 时由 guard 释放，才允许下一家 provider 接手。OAuth 类 provider
+            // 没有稳定静态 key，因此不进入 API-key 预算账本。
+            let credential_fingerprint =
+                match crate::services::usage_limit::resolve_credential(provider, app_type) {
+                    crate::services::usage_limit::CredentialResolution::StaticKey {
+                        fingerprint,
+                        ..
+                    } => Some(fingerprint),
+                    crate::services::usage_limit::CredentialResolution::Unsupported => None,
+                };
+            let mut budget_reservation = if let Some(ref fingerprint) = credential_fingerprint {
+                match self.router.db().reserve_budget_for_request(
+                    &self.budget_request_id,
+                    &provider.id,
+                    app_type_str,
+                    fingerprint,
+                    &body,
+                ) {
+                    Ok(Some(reservation)) => Some(BudgetReservationGuard::new(
+                        self.router.db().clone(),
+                        reservation,
+                    )),
+                    Ok(None) => None,
+                    Err(rejection) => {
+                        log::warn!(
+                            "[{app_type_str}] [Budget] 请求被使用限额拦截: provider={} ({})",
+                            provider.name,
+                            rejection.message
+                        );
+                        self.router
+                            .release_permit_neutral(
+                                &provider.id,
+                                app_type_str,
+                                used_half_open_permit,
+                            )
+                            .await;
+                        {
+                            let mut status = self.status.write().await;
+                            status.failed_requests += 1;
+                            status.last_error = Some(rejection.message.clone());
+                            if status.total_requests > 0 {
+                                status.success_rate = (status.success_requests as f32
+                                    / status.total_requests as f32)
+                                    * 100.0;
+                            }
+                        }
+                        let mut detail = rejection.detail;
+                        if let Some(detail_object) = detail.as_object_mut() {
+                            detail_object
+                                .entry("provider".to_string())
+                                .or_insert_with(|| json!(provider.name));
+                        }
+                        return Err(ForwardError {
+                            error: ProxyError::BudgetExhausted {
+                                message: rejection.message,
+                                detail,
+                            },
+                            provider: Some(provider.clone()),
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+
             // PRE-SEND 优化器：每个 provider 独立决定是否优化
             // clone body 以避免 Bedrock 优化字段泄漏到非 Bedrock provider（failover 场景）
             let mut provider_body =
@@ -587,10 +701,27 @@ impl RequestForwarder {
                         provider: provider.clone(),
                         claude_api_format,
                         outbound_model,
+                        credential_fingerprint: credential_fingerprint.clone(),
+                        budget_reservation: budget_reservation
+                            .take()
+                            .and_then(BudgetReservationGuard::into_reservation),
                         connection_guard: None,
                     });
                 }
                 Err(e) => {
+                    // A hard upstream quota/billing response is terminal for
+                    // this request. Convert it before rectifier/categorizer
+                    // logic so no failover path can bypass the upstream cap.
+                    let e = match e {
+                        ProxyError::UpstreamError { status, body } => {
+                            if let Some(detail) = upstream_budget_detail(status, body.as_deref()) {
+                                ProxyError::UpstreamBudgetExhausted { status, detail }
+                            } else {
+                                ProxyError::UpstreamError { status, body }
+                            }
+                        }
+                        other => other,
+                    };
                     // 检测是否需要触发整流器（仅 Claude/ClaudeAuth 供应商）
                     let provider_type = ProviderType::from_app_type_and_config(app_type, provider);
                     let is_anthropic_provider = matches!(
@@ -690,6 +821,10 @@ impl RequestForwarder {
                                         provider: provider.clone(),
                                         claude_api_format,
                                         outbound_model,
+                                        credential_fingerprint: credential_fingerprint.clone(),
+                                        budget_reservation: budget_reservation
+                                            .take()
+                                            .and_then(BudgetReservationGuard::into_reservation),
                                         connection_guard: None,
                                     });
                                 }
@@ -839,6 +974,10 @@ impl RequestForwarder {
                                             provider: provider.clone(),
                                             claude_api_format,
                                             outbound_model,
+                                            credential_fingerprint: credential_fingerprint.clone(),
+                                            budget_reservation: budget_reservation
+                                                .take()
+                                                .and_then(BudgetReservationGuard::into_reservation),
                                             connection_guard: None,
                                         });
                                     }
@@ -999,6 +1138,10 @@ impl RequestForwarder {
                                         provider: provider.clone(),
                                         claude_api_format,
                                         outbound_model,
+                                        credential_fingerprint: credential_fingerprint.clone(),
+                                        budget_reservation: budget_reservation
+                                            .take()
+                                            .and_then(BudgetReservationGuard::into_reservation),
                                         connection_guard: None,
                                     });
                                 }
@@ -2811,6 +2954,7 @@ impl RequestForwarder {
                 400 | 405 | 406 | 413 | 414 | 415 | 422 | 501 => ErrorCategory::NonRetryable,
                 _ => ErrorCategory::Retryable,
             },
+            ProxyError::UpstreamBudgetExhausted { .. } => ErrorCategory::NonRetryable,
             // Provider 级配置/转换问题：换一个 Provider 可能就能成功
             ProxyError::ConfigError(_) => ErrorCategory::Retryable,
             ProxyError::TransformError(_) => ErrorCategory::Retryable,
@@ -3892,6 +4036,7 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            budget_request_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -5521,5 +5666,222 @@ mod tests {
         });
         let body = body_with_image("any-model");
         assert!(fwd.media_retry_should_trigger("Claude", false, &body, &image_unsupported_error()));
+    }
+
+    // ---------------- Budget Guard 集成测试（需求 §39） ----------------
+
+    /// 构造带静态 key 的 provider 行（Claude app，走 ClaudeAdapter.extract_auth）
+    fn budget_test_provider(db: &Database, provider_id: &str) -> crate::provider::Provider {
+        let provider = crate::provider::Provider::with_id(
+            provider_id.to_string(),
+            format!("Budget Test {provider_id}"),
+            serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://budget-test.invalid",
+                    "ANTHROPIC_AUTH_TOKEN": format!("sk-test-budget-{provider_id}-0123456789"),
+                }
+            }),
+            None,
+        );
+        db.save_provider("claude", &provider)
+            .expect("save provider");
+        provider
+    }
+
+    fn insert_budget_log(
+        db: &Database,
+        request_id: &str,
+        provider_id: &str,
+        fingerprint: &str,
+        total_cost: &str,
+        input: i64,
+        output: i64,
+    ) {
+        let conn = db.conn.lock().expect("test db lock");
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, provider_id, app_type, model, request_model, pricing_model,
+                input_tokens, output_tokens, input_token_semantics,
+                total_cost_usd, latency_ms, status_code, created_at, data_source, credential_fingerprint
+             ) VALUES (?1, ?2, 'claude', 'gpt-test', 'gpt-test', 'gpt-test',
+                ?3, ?4, 2, ?5, 10, 200, ?6, 'proxy', ?7)",
+            rusqlite::params![
+                request_id,
+                provider_id,
+                input,
+                output,
+                total_cost,
+                1_000_100,
+                fingerprint
+            ],
+        )
+        .expect("insert budget log");
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_token_limit_blocks_before_upstream() {
+        // Case 1：limit 1000 tokens，已用 600，上一笔 500 tokens 已完成落库
+        // （total 1100 ≥ 1000）→ 下一请求必须在触达上游之前 BLOCK。
+        let fwd = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let db = fwd.router.db().clone();
+        let provider = budget_test_provider(&db, "budget-p1");
+        let fingerprint = crate::services::usage_limit::credential_fingerprint(
+            "claude",
+            "sk-test-budget-budget-p1-0123456789",
+        );
+
+        db.save_budget_config(
+            "budget-p1",
+            "claude",
+            &crate::services::usage_limit::UsageLimitConfig {
+                enabled: true,
+                limit_type: "token".to_string(),
+                currency: None,
+                limit_amount: Some("1000".to_string()),
+                reset_interval_seconds: None,
+            },
+        )
+        .expect("save limit");
+        // save_budget_config 会把统计窗口设成真实 now，而测试日志行是固定历史
+        // 时间戳——把窗口重置回测试时间线，让 r1 落入窗口内
+        db.reset_api_key_limit_window("budget-p1", "claude", 1_000_000)
+            .expect("reset window");
+        insert_budget_log(&db, "r1", "budget-p1", &fingerprint, "0.01", 600, 500);
+
+        let result = fwd
+            .forward_with_retry(
+                &crate::app_config::AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                serde_json::json!({"model": "claude-sonnet-4-5", "stream": false}),
+                axum::http::HeaderMap::new(),
+                http::Extensions::new(),
+                vec![provider],
+            )
+            .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("达到 token 限额必须被拒"),
+        };
+
+        match err.error {
+            ProxyError::BudgetExhausted { message, detail } => {
+                assert!(message.contains("token limit reached"), "{message}");
+                assert_eq!(detail["limitType"], "token");
+            }
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_money_limit_blocks_before_upstream() {
+        // Case 2：money limit $1，累计 $1.02 → 下一请求不发送 upstream。
+        let fwd = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let db = fwd.router.db().clone();
+        let provider = budget_test_provider(&db, "budget-p2");
+        let fingerprint = crate::services::usage_limit::credential_fingerprint(
+            "claude",
+            "sk-test-budget-budget-p2-0123456789",
+        );
+
+        db.save_budget_config(
+            "budget-p2",
+            "claude",
+            &crate::services::usage_limit::UsageLimitConfig {
+                enabled: true,
+                limit_type: "money".to_string(),
+                currency: Some("USD".to_string()),
+                limit_amount: Some("1".to_string()),
+                reset_interval_seconds: None,
+            },
+        )
+        .expect("save limit");
+        db.reset_api_key_limit_window("budget-p2", "claude", 1_000_000)
+            .expect("reset window");
+        insert_budget_log(&db, "r1", "budget-p2", &fingerprint, "1.02", 10, 10);
+
+        let result = fwd
+            .forward_with_retry(
+                &crate::app_config::AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                serde_json::json!({"model": "claude-sonnet-4-5", "stream": false}),
+                axum::http::HeaderMap::new(),
+                http::Extensions::new(),
+                vec![provider],
+            )
+            .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("达到金额限额必须被拒"),
+        };
+
+        match err.error {
+            ProxyError::BudgetExhausted { message, detail } => {
+                assert!(message.contains("usage limit reached"), "{message}");
+                assert_eq!(detail["limitType"], "money");
+                assert_eq!(detail["provider"], "Budget Test budget-p2");
+            }
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_guard_ignores_providers_without_limit() {
+        // Case 4：限额未配置 → guard 不拦截（直接验证 guard 层；guard 放行后的
+        // 完整转发行为由既有代理透传测试覆盖，这里不触网以避免环境依赖）
+        let fwd = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let db = fwd.router.db().clone();
+        let provider = budget_test_provider(&db, "budget-p3");
+        let fingerprint = crate::services::usage_limit::credential_fingerprint(
+            "claude",
+            "sk-test-budget-budget-p3-0123456789",
+        );
+
+        assert!(db
+            .check_budget_before_forward("budget-p3", &provider.name, "claude", &fingerprint)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn budget_disabled_limit_keeps_proxy_behavior() {
+        // Case 4 变体：配置存在但 enabled=false → 不拦截
+        let fwd = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let db = fwd.router.db().clone();
+        let provider = budget_test_provider(&db, "budget-p4");
+        let fingerprint = crate::services::usage_limit::credential_fingerprint(
+            "claude",
+            "sk-test-budget-budget-p4-0123456789",
+        );
+        db.save_budget_config(
+            "budget-p4",
+            "claude",
+            &crate::services::usage_limit::UsageLimitConfig {
+                enabled: false,
+                limit_type: "money".to_string(),
+                currency: Some("USD".to_string()),
+                limit_amount: Some("0.01".to_string()),
+                reset_interval_seconds: None,
+            },
+        )
+        .expect("save limit");
+        insert_budget_log(&db, "r1", "budget-p4", &fingerprint, "99.99", 10, 10);
+
+        assert!(db
+            .check_budget_before_forward("budget-p4", &provider.name, "claude", &fingerprint)
+            .is_ok());
+    }
+
+    #[test]
+    fn budget_error_maps_to_429() {
+        let error = ProxyError::BudgetExhausted {
+            message: "CC Switch usage limit reached. Provider: x. Used: $10.18 / Limit: $10.00"
+                .to_string(),
+            detail: serde_json::json!({"provider": "x"}),
+        };
+        assert_eq!(
+            crate::proxy::error_mapper::map_proxy_error_to_status(&error),
+            429
+        );
     }
 }

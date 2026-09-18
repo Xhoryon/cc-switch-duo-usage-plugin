@@ -209,7 +209,8 @@ impl Database {
             duration_ms INTEGER, status_code INTEGER NOT NULL, error_message TEXT, session_id TEXT,
             provider_type TEXT, is_streaming INTEGER NOT NULL DEFAULT 0,
             cost_multiplier TEXT NOT NULL DEFAULT '1.0', created_at INTEGER NOT NULL,
-            data_source TEXT NOT NULL DEFAULT 'proxy'
+            data_source TEXT NOT NULL DEFAULT 'proxy',
+            credential_fingerprint TEXT
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON proxy_request_logs(provider_id, app_type)", [])
@@ -352,6 +353,80 @@ impl Database {
             [],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 20. API Key 使用限额表（每个 Provider 一条配置，绑定到具体 credential 指纹）
+        //
+        // - credential_fingerprint：API Key 的不可逆 SHA-256 指纹，绝不存明文 key。
+        //   Provider 换 Key 后指纹不匹配，由服务层自动重绑并把 usage_start_at 重置为当下，
+        //   保证旧 Key 的历史用量不会计入新 Key。
+        // - limit_amount：十进制字符串（金额模式）或纯整数字符串（token 模式），
+        //   避免 SQLite REAL 浮点误差影响限额判断。
+        // - usage_start_at：预算统计窗口起点（unix 秒）。重置使用量 = 推进该时间戳，
+        //   不删除任何历史 Usage 明细。
+        // - 成本统计不在此表冗余存储（避免双 SSOT），始终从 proxy_request_logs 实时聚合。
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS api_key_limits (
+                provider_id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                credential_fingerprint TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                limit_type TEXT NOT NULL CHECK (limit_type IN ('money', 'token')),
+                currency TEXT CHECK (currency IN ('USD', 'CNY')),
+                limit_amount TEXT NOT NULL,
+                usage_start_at INTEGER NOT NULL,
+                reset_interval_seconds INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (provider_id, app_type),
+                FOREIGN KEY (provider_id, app_type) REFERENCES providers(id, app_type) ON DELETE CASCADE
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 21. 本地预算 reservation 表：只保存短生命周期的 reservation 状态，
+        // authoritative usage 仍来自 proxy_request_logs，不建立跨节点同步。
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS budget_reservations (
+                request_id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                credential_fingerprint TEXT NOT NULL,
+                limit_type TEXT NOT NULL CHECK (limit_type IN ('money', 'token')),
+                reserved_tokens INTEGER NOT NULL DEFAULT 0,
+                reserved_cost_usd TEXT NOT NULL DEFAULT '0',
+                consumed_tokens INTEGER NOT NULL DEFAULT 0,
+                consumed_cost_usd TEXT NOT NULL DEFAULT '0',
+                status TEXT NOT NULL CHECK (status IN ('pending', 'committed', 'released')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                FOREIGN KEY (provider_id, app_type)
+                    REFERENCES providers(id, app_type) ON DELETE CASCADE
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_budget_reservations_identity
+             ON budget_reservations(provider_id, app_type, credential_fingerprint, status, expires_at)",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 预算统计索引：按 (provider, app, credential, 时间窗) 聚合 proxy_request_logs。
+        // 旧库此时还没有 credential_fingerprint 列（迁移在 create_tables 之后才跑），
+        // 参照 create_request_logs_usage_indexes_if_supported 做列存在性防御。
+        if Self::table_exists(conn, "proxy_request_logs")?
+            && Self::has_column(conn, "proxy_request_logs", "credential_fingerprint")?
+        {
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_request_logs_budget
+                 ON proxy_request_logs(provider_id, app_type, credential_fingerprint, created_at)",
+                [],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
 
         // 修复跑过未发布开发版的库：current 标记曾是全局 key，现按应用分组
         // （随 v12 定稿为 current_profile_id_<scope>，不单独 bump 版本）
@@ -563,6 +638,21 @@ impl Database {
                             }
                         }
                         Self::set_user_version(conn, 19)?;
+                    }
+                    19 => {
+                        log::info!("迁移数据库从 v19 到 v20（添加 API Key 使用限额表）");
+                        Self::migrate_v19_to_v20(conn)?;
+                        Self::set_user_version(conn, 20)?;
+                    }
+                    20 => {
+                        log::info!("迁移数据库从 v20 到 v21（添加本地预算 reservation 表）");
+                        Self::migrate_v20_to_v21(conn)?;
+                        Self::set_user_version(conn, 21)?;
+                    }
+                    21 => {
+                        log::info!("迁移数据库从 v21 到 v22（添加限额自动重置周期）");
+                        Self::migrate_v21_to_v22(conn)?;
+                        Self::set_user_version(conn, 22)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1608,6 +1698,104 @@ impl Database {
                 conn,
                 "session_log_sync",
                 "last_tail_fingerprint",
+                "INTEGER",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// v19 -> v20 迁移：添加 API Key 使用限额表 + 预算统计索引
+    ///
+    /// 全新表，不触碰任何已有数据。CREATE TABLE IF NOT EXISTS 保证可重复执行。
+    fn migrate_v19_to_v20(conn: &Connection) -> Result<(), AppError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS api_key_limits (
+                provider_id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                credential_fingerprint TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                limit_type TEXT NOT NULL CHECK (limit_type IN ('money', 'token')),
+                currency TEXT CHECK (currency IN ('USD', 'CNY')),
+                limit_amount TEXT NOT NULL,
+                usage_start_at INTEGER NOT NULL,
+                reset_interval_seconds INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (provider_id, app_type),
+                FOREIGN KEY (provider_id, app_type) REFERENCES providers(id, app_type) ON DELETE CASCADE
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 api_key_limits 表失败: {e}")))?;
+
+        // 为预算统计补上 credential_fingerprint 列（历史行为 NULL，不参与预算）
+        if Self::table_exists(conn, "proxy_request_logs")? {
+            Self::add_column_if_missing(
+                conn,
+                "proxy_request_logs",
+                "credential_fingerprint",
+                "TEXT",
+            )?;
+            // 早期 schema 的极简旧库（含迁移测试手工构造的形状）可能缺
+            // provider_id/app_type 列，参照 create_request_logs_usage_indexes_if_supported
+            // 做列存在性防御；真实库由 create_tables_on_conn 保证两列始终存在
+            let has_budget_columns = Self::has_column(conn, "proxy_request_logs", "provider_id")?
+                && Self::has_column(conn, "proxy_request_logs", "app_type")?;
+            if has_budget_columns {
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_request_logs_budget
+                     ON proxy_request_logs(provider_id, app_type, credential_fingerprint, created_at)",
+                    [],
+                )
+                .map_err(|e| AppError::Database(format!("创建预算统计索引失败: {e}")))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// v20 -> v21 迁移：添加本地 Budget Reservation 表与身份索引。
+    ///
+    /// Reservation 只用于并发请求的短期占用，不替代 proxy_request_logs
+    /// authoritative ledger，也不包含 API key 明文。
+    fn migrate_v20_to_v21(conn: &Connection) -> Result<(), AppError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS budget_reservations (
+                request_id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                credential_fingerprint TEXT NOT NULL,
+                limit_type TEXT NOT NULL CHECK (limit_type IN ('money', 'token')),
+                reserved_tokens INTEGER NOT NULL DEFAULT 0,
+                reserved_cost_usd TEXT NOT NULL DEFAULT '0',
+                consumed_tokens INTEGER NOT NULL DEFAULT 0,
+                consumed_cost_usd TEXT NOT NULL DEFAULT '0',
+                status TEXT NOT NULL CHECK (status IN ('pending', 'committed', 'released')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                FOREIGN KEY (provider_id, app_type)
+                    REFERENCES providers(id, app_type) ON DELETE CASCADE
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 budget_reservations 表失败: {e}")))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_budget_reservations_identity
+             ON budget_reservations(provider_id, app_type, credential_fingerprint, status, expires_at)",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 reservation 索引失败: {e}")))?;
+        Ok(())
+    }
+
+    /// v21 -> v22 迁移：为 API Key 限额增加惰性自动重置周期。
+    fn migrate_v21_to_v22(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "api_key_limits")? {
+            Self::add_column_if_missing(
+                conn,
+                "api_key_limits",
+                "reset_interval_seconds",
                 "INTEGER",
             )?;
         }
@@ -3596,6 +3784,62 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrate_v20_to_v21_adds_budget_reservation_table() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        Database::create_tables_on_conn(&conn)?;
+        conn.execute("DROP TABLE budget_reservations", [])?;
+        Database::set_user_version(&conn, 20)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        assert!(Database::table_exists(&conn, "budget_reservations")?);
+        let index_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_budget_reservations_identity'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(index_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v21_to_v22_adds_reset_interval_column() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute(
+            "CREATE TABLE providers (id TEXT NOT NULL, app_type TEXT NOT NULL, PRIMARY KEY (id, app_type))",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE api_key_limits (
+                provider_id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                credential_fingerprint TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                limit_type TEXT NOT NULL,
+                currency TEXT,
+                limit_amount TEXT NOT NULL,
+                usage_start_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (provider_id, app_type)
+            )",
+            [],
+        )?;
+        Database::set_user_version(&conn, 21)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        assert!(Database::has_column(
+            &conn,
+            "api_key_limits",
+            "reset_interval_seconds"
+        )?);
+        Ok(())
+    }
 
     #[test]
     fn migrate_v12_to_v13_adds_input_token_semantics_columns() -> Result<(), AppError> {

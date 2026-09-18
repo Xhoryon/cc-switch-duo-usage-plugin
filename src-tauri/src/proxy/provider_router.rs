@@ -37,6 +37,11 @@ impl ProviderRouter {
         }
     }
 
+    /// 访问共享数据库连接（供转发前的 Budget Guard 等同步查询使用）
+    pub(crate) fn db(&self) -> &Arc<Database> {
+        &self.db
+    }
+
     /// 选择可用的供应商（支持故障转移）
     ///
     /// 返回按优先级排序的可用供应商列表：

@@ -29,3 +29,6 @@ copilot-api
 .history
 CODEBUDDY.md
 mainWindow.js
+
+# mimosa security scanner workspace (local only)
+.mimosa/

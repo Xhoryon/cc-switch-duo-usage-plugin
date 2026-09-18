@@ -10,6 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-18-api-key-pairing-design.md`; authoritative requirements: `../../../../CC Switch Usage Duo Plugin — API Key Pairing Development Specification.md`.
 
+## Implementation status (2026-09-18)
+
+The implementation is complete against the authoritative specification, with the additional local reset schedule requested after the original plan: `NULL`/never, hourly, and daily windows are persisted by schema v22. The repository's existing architecture places the reusable streaming meter in `proxy/response_processor.rs` and the real two-listener HTTP coverage in `proxy/server.rs` tests rather than the originally proposed standalone files. Frontend status remains deliberately local/proxy-only; no node-pairing or upstream runtime state is shown. The release boundary is explicit: the host application remains CC Switch 3.20.3 while this repository publishes Usage Plugin v1.0.1 as tag `v1.0.1`, without signing.
+
 ## Global Constraints
 
 - Pairing means `Same API Key → Same API Key Identity → Same Key Fingerprint`; never add Switch/node pairing.
@@ -375,7 +379,7 @@ Run: `pnpm exec vitest run tests/components/UsageLimitDialog.test.tsx && pnpm ty
 - Modify: `/Users/jiayihuang/Downloads/CC Switch Duo Usage Plugin/知识库.md`
 - Modify: verification result files only through the existing scripts
 
-- [ ] **Step 1: Record the complete implementation**
+- [x] **Step 1: Record the complete implementation**
 
 Record goal, correct pairing model, namespace fingerprint, local independence, reservation lifecycle/TTL, Budget Gate order, streaming cutoff, proxy-only ledger, upstream terminal error, database v21, tests, known limitations, and next steps. Include exactly:
 
@@ -385,7 +389,7 @@ and:
 
 > Each CC Switch maintains its own local limit and authoritative proxy ledger. The first exhausted gate in the request chain stops further token delivery.
 
-- [ ] **Step 2: Run complete verification**
+- [x] **Step 2: Run complete verification**
 
 Run from `cc-switch/`:
 
@@ -403,28 +407,30 @@ cd ..
 pnpm build
 ```
 
-Expected: all required commands pass. If the pinned 1.95 toolchain remains damaged, record the stable-toolchain workaround without changing unrelated toolchain files.
+Expected: all required commands pass. If the pinned 1.95 toolchain remains damaged, record the stable-toolchain workaround without changing unrelated toolchain files. Current evidence uses the installed local Node CLIs because Corepack signature verification fails for the pinned pnpm package, and uses `RUSTUP_TOOLCHAIN=stable` for Rust/Tauri.
 
-- [ ] **Step 3: Run existing verification scripts**
+- [x] **Step 3: Run existing verification scripts**
 
 Run `bash quick-verify.sh > quick-verify-results.txt 2>&1` and `bash run-verify.sh > verify-results.txt 2>&1`; inspect exit codes and record results.
 
-- [ ] **Step 4: Audit forbidden architecture and secrets**
+- [x] **Step 4: Audit forbidden architecture and secrets**
 
 Search changed files for `Pairing Secret`, `Node Pairing`, `QR Code`, `Node Registration`, `Paired Switch`, new plaintext-key fields, full key values, and full fingerprints in logs/UI/errors/tests outside synthetic fixtures.
 
-- [ ] **Step 5: Update and commit completion documentation**
+- [x] **Step 5: Update and commit completion documentation**
 
-Run `git add docs/development_log.md docs/superpowers/plans/2026-09-18-api-key-pairing.md && git commit --only docs/development_log.md docs/superpowers/plans/2026-09-18-api-key-pairing.md -m "docs: record Usage Duo implementation and verification"`. The root workspace logs are updated in the same completion change but remain outside this repository's commit.
+Release documentation, four locale README files, the v1.0.1 release notes, plugin manifest, and the unsigned GitHub release workflow are included in the final release commit. The root workspace logs are updated in the same completion change but remain outside this repository's commit.
+
+The code and verification checklist below records implementation evidence. The final release commit and `v1.0.1` tag are created only after the fresh verification gate passes.
 
 ## Self-review checklist
 
-- [ ] Sections 1–8: identity-only pairing and no node protocol covered by Tasks 1, 3, 4, and 9.
-- [ ] Sections 9–20: independent limits, request gate, terminal upstream block, and no bypass covered by Tasks 2–4 and 6.
-- [ ] Sections 21–27: streaming meter, cutoff, cancellation, provisional usage, and reconciliation covered by Tasks 5 and 7.
-- [ ] Sections 28–36: normalized tokens, pricing, CNY, unknown pricing, proxy-only ledger, and no global counter covered by Tasks 3, 7, and 9.
-- [ ] Sections 37–43: reservations, request binding, lifecycle, TTL recovery, structured 429, and terminal errors covered by Tasks 2–4.
-- [ ] Sections 44–57: remote boundary, UI, local reset, SQLite/index, frontend/backend reuse covered by Tasks 2, 4, 8, and 9.
-- [ ] Sections 58–71: HTTP topology, streaming, concurrency, double-count, reset/key replacement, and forbidden architectures covered by Tasks 6, 7, and 9.
-- [ ] Sections 72–75: Definition of Done, preflight inspection, development log, and final report covered by Task 9.
-- [ ] No plan placeholder remains; every task has files, interfaces, failing-test steps, implementation steps, and validation commands.
+- [x] Sections 1–8: identity-only pairing and no node protocol covered by Tasks 1, 3, 4, and 9.
+- [x] Sections 9–20: independent limits, request gate, terminal upstream block, and no bypass covered by Tasks 2–4 and 6.
+- [x] Sections 21–27: streaming meter, cutoff, cancellation, provisional usage, and reconciliation covered by Tasks 5 and 7.
+- [x] Sections 28–36: normalized tokens, pricing, CNY, unknown pricing, proxy-only ledger, and no global counter covered by Tasks 3, 7, and 9.
+- [x] Sections 37–43: reservations, request binding, lifecycle, TTL recovery, structured 429, and terminal errors covered by Tasks 2–4.
+- [x] Sections 44–57: remote boundary, UI, local reset, SQLite/index, frontend/backend reuse covered by Tasks 2, 4, 8, and 9.
+- [x] Sections 58–71: HTTP topology, streaming, concurrency, double-count, reset/key replacement, and forbidden architectures covered by Tasks 6, 7, and 9.
+- [x] Sections 72–75: Definition of Done, preflight inspection, development log, release notes, and final report covered by Task 9.
+- [x] No plan placeholder remains; every task has files, interfaces, failing-test steps, implementation steps, and validation commands.

@@ -1,0 +1,9 @@
+{
+  "name": "ccswitch-usage-plugin",
+  "version": "1.0.1",
+  "releaseTag": "v1.0.1",
+  "hostApplication": "CC Switch",
+  "hostVersion": "3.20.3",
+  "platform": "macOS Apple Silicon",
+  "signed": false
+}

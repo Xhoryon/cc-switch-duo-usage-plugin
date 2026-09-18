@@ -106,9 +106,10 @@ CC Switch User Manual
 
 ## Version Information
 
-- Documentation version: v3.16.0
-- Last updated: 2026-05-29
-- Applicable to CC Switch v3.16.0+
+- Host application documentation baseline: CC Switch v3.20.3
+- Usage Plugin supplement: v1.0.1
+- Last updated: 2026-09-18
+- The plugin-specific release notes are available in English, Simplified Chinese, Traditional Chinese, and Japanese.
 
 ### v3.16.0 Highlights
 

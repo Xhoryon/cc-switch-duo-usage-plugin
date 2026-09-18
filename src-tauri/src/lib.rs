@@ -1606,6 +1606,12 @@ pub fn run() {
             commands::save_models_dev_sync_config,
             commands::record_models_dev_sync_result,
             commands::check_provider_limits,
+            // API Key 使用限额（Budget Limit）
+            commands::get_usage_limit_status,
+            commands::save_usage_limit,
+            commands::reset_usage_limit,
+            commands::get_usd_cny_rate,
+            commands::set_usd_cny_rate,
             // Session usage sync
             commands::sync_session_usage,
             commands::rebuild_codex_usage,

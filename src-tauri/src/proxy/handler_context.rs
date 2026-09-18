@@ -11,6 +11,7 @@ use crate::proxy::{
     types::{AppProxyConfig, CopilotOptimizerConfig, OptimizerConfig, RectifierConfig},
     ProxyError,
 };
+use crate::services::usage_limit::BudgetReservation;
 use axum::http::HeaderMap;
 use std::time::Instant;
 
@@ -53,6 +54,13 @@ pub struct RequestContext {
     /// usage 归因的兜底顺序：上游响应回显 → outbound_model → request_model。
     /// 不能直接用 request_model 兜底：接管场景下它是映射前的客户端别名。
     pub outbound_model: Option<String>,
+    /// 实际使用的 API Key 指纹（不可逆 SHA-256；forward 成功后从
+    /// ForwardResult 回填）。usage 落库时随行写入，供使用限额按 credential
+    /// 聚合。OAuth 类 provider / 无静态 key 时为 None。
+    pub credential_fingerprint: Option<String>,
+    /// Local API-key budget reservation transferred from the forwarder to
+    /// response processing for final reconciliation.
+    pub budget_reservation: Option<BudgetReservation>,
     /// 日志标签（如 "Claude"、"Codex"、"Gemini"）
     pub tag: &'static str,
     /// 应用类型字符串（如 "claude"、"codex"、"gemini"）
@@ -165,6 +173,8 @@ impl RequestContext {
             current_provider_id,
             request_model,
             outbound_model: None,
+            credential_fingerprint: None,
+            budget_reservation: None,
             tag,
             app_type_str,
             app_type,

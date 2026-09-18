@@ -26,6 +26,7 @@ import {
   useOpenClawLiveProviderIds,
   useOpenClawDefaultModel,
 } from "@/hooks/useOpenClaw";
+import { useUsageLimitEventBridge } from "@/hooks/useUsageEventBridge";
 import {
   useHermesLiveProviderIds,
   useHermesModelConfig,
@@ -95,6 +96,8 @@ export function ProviderList({
 }: ProviderListProps) {
   const { t } = useTranslation();
   const { checkProvider, isChecking } = useStreamCheck(appId);
+  // 请求记账后刷新各卡片的限额图标 / Dialog（详见 useUsageLimitEventBridge）
+  useUsageLimitEventBridge();
   const { sortedProviders, sensors, handleDragEnd } = useDragSort(
     providers,
     appId,

@@ -1,4 +1,4 @@
-# CC Switch User Manual / 用户手册 / ユーザーマニュアル
+# CC Switch User Manual / 用户手册 / 使用者手冊 / ユーザーマニュアル
 
 > Claude Code / Claude Desktop / Codex / Gemini CLI / OpenCode / OpenClaw / Hermes
 
@@ -7,14 +7,16 @@
 | Language | Link |
 |----------|------|
 | [中文](./zh/README.md) | 简体中文用户手册 |
+| [繁體中文](./zh-TW/README.md) | 繁體中文使用者手冊（Usage Plugin 補充） |
 | [English](./en/README.md) | English User Manual |
 | [日本語](./ja/README.md) | 日本語ユーザーマニュアル |
 
 ## Version / 版本 / バージョン
 
-- Documentation version: v3.16.0
-- Last updated: 2026-05-29
-- Compatible with CC Switch v3.16.0+
+- Host application documentation baseline: CC Switch v3.20.3
+- Usage Plugin supplement: v1.0.1
+- Last updated: 2026-09-18
+- The full manual follows the upstream CC Switch documentation baseline; the plugin-specific supplement is available in all four languages.
 
 ## Links
 

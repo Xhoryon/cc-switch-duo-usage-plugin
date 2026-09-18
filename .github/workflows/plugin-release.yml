@@ -1,0 +1,75 @@
+name: Usage Plugin Release
+
+on:
+  push:
+    tags:
+      - "v1.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: usage-plugin-release-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build unsigned macOS Apple Silicon release
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.3
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build unsigned Tauri app and DMG
+        run: >-
+          pnpm exec tauri build
+          --target aarch64-apple-darwin
+          --bundles app,dmg
+          --ci
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Prepare GitHub Release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          app_path="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/CC Switch.app"
+          dmg_path="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/CC Switch_3.20.3_aarch64.dmg"
+          app_zip="release-assets/CC-Switch-3.20.3-Usage-Plugin-${GITHUB_REF_NAME}-macOS-arm64.zip"
+          dmg_asset="release-assets/CC-Switch-3.20.3-Usage-Plugin-${GITHUB_REF_NAME}-macOS-arm64.dmg"
+          source_zip="release-assets/ccswitch-usage-plugin-${GITHUB_REF_NAME}-source.zip"
+
+          test -d "$app_path"
+          test -f "$dmg_path"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$app_zip"
+          cp "$dmg_path" "$dmg_asset"
+          git archive --format=zip --prefix="ccswitch-usage-plugin-${GITHUB_REF_NAME}/" -o "$source_zip" HEAD
+
+          shasum -a 256 "$app_zip" "$dmg_asset" "$source_zip"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: CC Switch Usage Plugin ${{ github.ref_name }}
+          body_path: docs/release-notes/v1.0.1.md
+          generate_release_notes: false
+          files: release-assets/*

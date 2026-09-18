@@ -71,6 +71,24 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Match the normalized token semantics used by `proxy_request_logs` and
+    /// the usage-limit aggregate. Claude-style input is already fresh; Codex,
+    /// Gemini and Grok Build may report input including cached tokens.
+    pub fn normalized_total_tokens_for_app(&self, app_type: &str) -> i64 {
+        let fresh_input = if crate::services::sql_helpers::is_cache_inclusive_app(app_type) {
+            i64::from(self.input_tokens).saturating_sub(
+                i64::from(self.cache_read_tokens)
+                    .saturating_add(i64::from(self.cache_creation_tokens)),
+            )
+        } else {
+            i64::from(self.input_tokens)
+        };
+        fresh_input
+            .saturating_add(i64::from(self.output_tokens))
+            .saturating_add(i64::from(self.cache_read_tokens))
+            .saturating_add(i64::from(self.cache_creation_tokens))
+    }
+
     /// 生成稳定 request_id。Claude 不加作用域，以便继续与 session JSONL 的
     /// `session:{message_id}` 主键收敛；其他协议加入 app/provider 作用域，避免
     /// 不同上游复用 envelope id 时互相覆盖。

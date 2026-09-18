@@ -52,6 +52,9 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
         // 认证错误：401 Unauthorized
         ProxyError::AuthError(_) => 401,
 
+        // 使用限额达到：429 Too Many Requests（转发被 Budget Guard 拦截）
+        ProxyError::BudgetExhausted { .. } => 429,
+
         // 数据库错误：500 Internal Server Error
         ProxyError::DatabaseError(_) => 500,
 

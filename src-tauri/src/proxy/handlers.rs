@@ -36,9 +36,10 @@ use super::{
         transform_gemini, transform_responses,
     },
     response_processor::{
-        create_logged_passthrough_stream, create_usage_collector, process_response,
-        read_decoded_body, strip_entity_headers_for_rebuilt_body,
-        strip_hop_by_hop_response_headers, usage_logging_enabled, SseUsageCollector,
+        create_logged_passthrough_stream, create_streaming_budget_meter, create_usage_collector,
+        finalize_budget_reservation_without_logging, process_response, read_decoded_body,
+        strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
+        usage_logging_enabled, SseUsageCollector,
     },
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
@@ -226,6 +227,8 @@ async fn handle_messages_for_app(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.credential_fingerprint = result.credential_fingerprint.take();
+    ctx.budget_reservation = result.budget_reservation.take();
     ctx.provider = result.provider;
     let api_format = result
         .claude_api_format
@@ -309,6 +312,8 @@ struct ClaudeUsageLog {
     latency_ms: u64,
     status_code: u16,
     is_streaming: bool,
+    credential_fingerprint: Option<String>,
+    budget_reservation_id: Option<String>,
 }
 
 fn prepare_claude_usage_log(
@@ -342,6 +347,11 @@ fn prepare_claude_usage_log(
         latency_ms: ctx.latency_ms(),
         status_code,
         is_streaming,
+        credential_fingerprint: ctx.credential_fingerprint.clone(),
+        budget_reservation_id: ctx
+            .budget_reservation
+            .as_ref()
+            .map(|reservation| reservation.request_id.clone()),
     })
 }
 
@@ -359,6 +369,8 @@ async fn write_claude_usage_log(state: &ProxyState, log: ClaudeUsageLog) {
         log.is_streaming,
         log.status_code,
         Some(log.session_id),
+        log.credential_fingerprint,
+        log.budget_reservation_id,
     )
     .await;
 }
@@ -465,6 +477,11 @@ async fn handle_claude_transform(
             let status_code = status.as_u16();
             let start_time = ctx.start_time;
             let session_id = ctx.session_id.clone();
+            let credential_fingerprint = ctx.credential_fingerprint.clone();
+            let budget_reservation_id = ctx
+                .budget_reservation
+                .as_ref()
+                .map(|reservation| reservation.request_id.clone());
             // 用 ctx 的 app_type：Claude Desktop 网关也走此转换路径，硬编码
             // "claude" 会把 claude-desktop 的行错记到 claude 名下
             let app_type_str = ctx.app_type_str;
@@ -483,6 +500,8 @@ async fn handle_claude_transform(
                         let state = state.clone();
                         let provider_id = provider_id.clone();
                         let session_id = session_id.clone();
+                        let credential_fingerprint = credential_fingerprint.clone();
+                        let budget_reservation_id = budget_reservation_id.clone();
                         let request_model = request_model.clone();
                         let outbound_model = fallback_model.clone();
 
@@ -500,6 +519,8 @@ async fn handle_claude_transform(
                                 true,
                                 status_code,
                                 Some(session_id),
+                                credential_fingerprint,
+                                budget_reservation_id,
                             )
                             .await;
                         });
@@ -521,6 +542,7 @@ async fn handle_claude_transform(
             usage_collector,
             timeout_config,
             connection_guard,
+            create_streaming_budget_meter(ctx, state),
         );
 
         let mut headers = axum::http::HeaderMap::new();
@@ -675,6 +697,7 @@ async fn handle_claude_transform(
     // 全 0 usage 不落账（对齐 Codex 流式收集器的 skip）：SSE 聚合兜底救回的流
     // 在上游缺 stream_options.include_usage 时没有 usage，写入只会产生无意义空行
     spawn_claude_usage_log(state, ctx, &anthropic_response, status.as_u16(), false);
+    finalize_budget_reservation_without_logging(ctx, state);
 
     // 构建响应
     let mut builder = axum::response::Response::builder().status(status);
@@ -811,6 +834,8 @@ pub async fn handle_chat_completions(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.credential_fingerprint = result.credential_fingerprint.take();
+    ctx.budget_reservation = result.budget_reservation.take();
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -906,6 +931,8 @@ async fn handle_responses_for_app(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.credential_fingerprint = result.credential_fingerprint.take();
+    ctx.budget_reservation = result.budget_reservation.take();
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -1047,6 +1074,8 @@ async fn handle_codex_standalone_passthrough(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.credential_fingerprint = result.credential_fingerprint.take();
+    ctx.budget_reservation = result.budget_reservation.take();
     ctx.provider = result.provider;
 
     process_response(
@@ -1130,6 +1159,8 @@ async fn handle_responses_compact_for_app(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.credential_fingerprint = result.credential_fingerprint.take();
+    ctx.budget_reservation = result.budget_reservation.take();
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -1224,6 +1255,7 @@ async fn handle_codex_xai_native_responses_rewrite(
             usage_collector,
             ctx.streaming_timeout_config(),
             connection_guard,
+            create_streaming_budget_meter(ctx, state),
         );
 
         let body = axum::body::Body::from_stream(logged_stream);
@@ -1278,6 +1310,11 @@ async fn handle_codex_xai_native_responses_rewrite(
                     let state = state.clone();
                     let provider_id = ctx.provider.id.clone();
                     let session_id = ctx.session_id.clone();
+                    let credential_fingerprint = ctx.credential_fingerprint.clone();
+                    let budget_reservation_id = ctx
+                        .budget_reservation
+                        .as_ref()
+                        .map(|reservation| reservation.request_id.clone());
                     let latency_ms = ctx.latency_ms();
                     async move {
                         log_usage(
@@ -1293,6 +1330,8 @@ async fn handle_codex_xai_native_responses_rewrite(
                             false,
                             status.as_u16(),
                             Some(session_id),
+                            credential_fingerprint,
+                            budget_reservation_id,
                         )
                         .await;
                     }
@@ -1308,6 +1347,8 @@ async fn handle_codex_xai_native_responses_rewrite(
         }
         Err(_) => body_bytes,
     };
+
+    finalize_budget_reservation_without_logging(ctx, state);
 
     strip_entity_headers_for_rebuilt_body(&mut response_headers);
     response_headers.remove(axum::http::header::CONTENT_TYPE);
@@ -1362,6 +1403,11 @@ async fn handle_codex_chat_to_responses_transform(
             let app_type_str = ctx.app_type_str;
             let start_time = ctx.start_time;
             let session_id = ctx.session_id.clone();
+            let credential_fingerprint = ctx.credential_fingerprint.clone();
+            let budget_reservation_id = ctx
+                .budget_reservation
+                .as_ref()
+                .map(|reservation| reservation.request_id.clone());
 
             Some(SseUsageCollector::new(
                 start_time,
@@ -1390,6 +1436,8 @@ async fn handle_codex_chat_to_responses_transform(
                     let request_model = request_model.clone();
                     let outbound_model = fallback_model.clone();
                     let session_id = session_id.clone();
+                    let credential_fingerprint = credential_fingerprint.clone();
+                    let budget_reservation_id = budget_reservation_id.clone();
 
                     tokio::spawn(async move {
                         log_usage(
@@ -1405,6 +1453,8 @@ async fn handle_codex_chat_to_responses_transform(
                             true,
                             status.as_u16(),
                             Some(session_id),
+                            credential_fingerprint,
+                            budget_reservation_id,
                         )
                         .await;
                     });
@@ -1420,6 +1470,7 @@ async fn handle_codex_chat_to_responses_transform(
             usage_collector,
             ctx.streaming_timeout_config(),
             connection_guard,
+            create_streaming_budget_meter(ctx, state),
         );
 
         let mut headers = axum::http::HeaderMap::new();
@@ -1511,6 +1562,11 @@ async fn handle_codex_chat_to_responses_transform(
             let state = state.clone();
             let provider_id = ctx.provider.id.clone();
             let session_id = ctx.session_id.clone();
+            let credential_fingerprint = ctx.credential_fingerprint.clone();
+            let budget_reservation_id = ctx
+                .budget_reservation
+                .as_ref()
+                .map(|reservation| reservation.request_id.clone());
             let latency_ms = ctx.latency_ms();
             async move {
                 log_usage(
@@ -1526,11 +1582,15 @@ async fn handle_codex_chat_to_responses_transform(
                     false,
                     status.as_u16(),
                     Some(session_id),
+                    credential_fingerprint,
+                    budget_reservation_id,
                 )
                 .await;
             }
         });
     }
+
+    finalize_budget_reservation_without_logging(ctx, state);
 
     strip_entity_headers_for_rebuilt_body(&mut response_headers);
     strip_hop_by_hop_response_headers(&mut response_headers);
@@ -1676,6 +1736,11 @@ async fn handle_codex_anthropic_to_responses_transform(
             let state = state.clone();
             let provider_id = ctx.provider.id.clone();
             let session_id = ctx.session_id.clone();
+            let credential_fingerprint = ctx.credential_fingerprint.clone();
+            let budget_reservation_id = ctx
+                .budget_reservation
+                .as_ref()
+                .map(|reservation| reservation.request_id.clone());
             let latency_ms = ctx.latency_ms();
             async move {
                 log_usage(
@@ -1691,11 +1756,15 @@ async fn handle_codex_anthropic_to_responses_transform(
                     false,
                     status.as_u16(),
                     Some(session_id),
+                    credential_fingerprint,
+                    budget_reservation_id,
                 )
                 .await;
             }
         });
     }
+
+    finalize_budget_reservation_without_logging(ctx, state);
 
     strip_entity_headers_for_rebuilt_body(&mut response_headers);
     strip_hop_by_hop_response_headers(&mut response_headers);
@@ -1741,6 +1810,11 @@ fn build_codex_anthropic_sse_response(
         let app_type_str = ctx.app_type_str;
         let start_time = ctx.start_time;
         let session_id = ctx.session_id.clone();
+        let credential_fingerprint = ctx.credential_fingerprint.clone();
+        let budget_reservation_id = ctx
+            .budget_reservation
+            .as_ref()
+            .map(|reservation| reservation.request_id.clone());
 
         Some(SseUsageCollector::new(
             start_time,
@@ -1763,6 +1837,8 @@ fn build_codex_anthropic_sse_response(
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
                 let session_id = session_id.clone();
+                let credential_fingerprint = credential_fingerprint.clone();
+                let budget_reservation_id = budget_reservation_id.clone();
 
                 tokio::spawn(async move {
                     log_usage(
@@ -1778,6 +1854,8 @@ fn build_codex_anthropic_sse_response(
                         true,
                         status.as_u16(),
                         Some(session_id),
+                        credential_fingerprint,
+                        budget_reservation_id,
                     )
                     .await;
                 });
@@ -1793,6 +1871,7 @@ fn build_codex_anthropic_sse_response(
         usage_collector,
         ctx.streaming_timeout_config(),
         connection_guard,
+        create_streaming_budget_meter(ctx, state),
     );
 
     let mut headers = axum::http::HeaderMap::new();
@@ -2043,6 +2122,8 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::TransformError(_) => "cc_switch_transform_error",
         ProxyError::InvalidRequest(_) => "cc_switch_invalid_request",
         ProxyError::AuthError(_) => "cc_switch_auth_error",
+        ProxyError::BudgetExhausted { .. } => "cc_switch_usage_limit_reached",
+        ProxyError::UpstreamBudgetExhausted { .. } => "cc_switch_upstream_usage_limit_reached",
         ProxyError::UpstreamError { .. } => "cc_switch_upstream_error",
         ProxyError::DatabaseError(_) => "cc_switch_database_error",
         ProxyError::Internal(_) => "cc_switch_internal_error",
@@ -2139,6 +2220,8 @@ pub async fn handle_gemini(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    ctx.credential_fingerprint = result.credential_fingerprint.take();
+    ctx.budget_reservation = result.budget_reservation.take();
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -2814,6 +2897,8 @@ async fn log_usage(
     is_streaming: bool,
     status_code: u16,
     session_id: Option<String>,
+    credential_fingerprint: Option<String>,
+    budget_reservation_id: Option<String>,
 ) {
     use super::usage::logger::UsageLogger;
 
@@ -2834,7 +2919,8 @@ async fn log_usage(
     let dedup_scope = super::usage::parser::dedup_scope_for_app(app_type, provider_id);
     let request_id = usage.dedup_request_id(dedup_scope);
 
-    if let Err(e) = logger.log_with_calculation(
+    let consumed_tokens = usage.normalized_total_tokens_for_app(app_type);
+    match logger.log_with_calculation(
         request_id,
         provider_id.to_string(),
         app_type.to_string(),
@@ -2849,8 +2935,22 @@ async fn log_usage(
         session_id,
         None, // provider_type
         is_streaming,
+        credential_fingerprint,
     ) {
-        log::warn!("[USG-001] 记录使用量失败: {e}");
+        Ok(consumed_cost_usd) => {
+            if let Some(reservation_id) = budget_reservation_id {
+                if let Err(error) = state.db.reconcile_budget_reservation(
+                    &reservation_id,
+                    consumed_tokens,
+                    &consumed_cost_usd.normalize().to_string(),
+                ) {
+                    log::warn!(
+                        "[Budget] usage 结算 reservation 失败: request_id={reservation_id}, error={error}"
+                    );
+                }
+            }
+        }
+        Err(error) => log::warn!("[USG-001] 记录使用量失败: {error}"),
     }
 }
 

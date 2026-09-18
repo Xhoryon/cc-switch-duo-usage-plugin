@@ -85,6 +85,9 @@ pub struct RequestLog {
     pub is_streaming: bool,
     /// 成本倍数
     pub cost_multiplier: String,
+    /// 实际使用的 API Key 指纹（不可逆 SHA-256）。供使用限额按 credential
+    /// 聚合；OAuth 类 provider / 无静态 key / 会话日志同步行为 None（不参与预算）。
+    pub credential_fingerprint: Option<String>,
 }
 
 /// 使用量记录器
@@ -173,8 +176,9 @@ impl<'a> UsageLogger<'a> {
                 input_token_semantics,
                 input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                 latency_ms, first_token_ms, status_code, error_message, session_id,
-                provider_type, is_streaming, cost_multiplier, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                provider_type, is_streaming, cost_multiplier, created_at,
+                credential_fingerprint
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
         );
         let affected_rows = conn
             .execute(
@@ -205,6 +209,7 @@ impl<'a> UsageLogger<'a> {
                     log.is_streaming as i64,
                     log.cost_multiplier,
                     created_at,
+                    log.credential_fingerprint,
                 ],
             )
             .map_err(|e| AppError::Database(format!("记录请求日志失败: {e}")))?;
@@ -286,6 +291,7 @@ impl<'a> UsageLogger<'a> {
             provider_type: None,
             is_streaming: false,
             cost_multiplier: "1.0".to_string(),
+            credential_fingerprint: None,
         };
 
         self.log_request(&log)
@@ -327,6 +333,7 @@ impl<'a> UsageLogger<'a> {
             provider_type,
             is_streaming,
             cost_multiplier: "1.0".to_string(),
+            credential_fingerprint: None,
         };
 
         self.log_request(&log)
@@ -459,7 +466,8 @@ impl<'a> UsageLogger<'a> {
         session_id: Option<String>,
         provider_type: Option<String>,
         is_streaming: bool,
-    ) -> Result<(), AppError> {
+        credential_fingerprint: Option<String>,
+    ) -> Result<Decimal, AppError> {
         let pricing = self.get_model_pricing(&pricing_model)?;
 
         let has_usage = usage.input_tokens > 0
@@ -477,6 +485,10 @@ impl<'a> UsageLogger<'a> {
             pricing.as_ref(),
             cost_multiplier,
         );
+        let total_cost_usd = cost
+            .as_ref()
+            .map(|value| value.total_cost)
+            .unwrap_or(Decimal::ZERO);
 
         let log = RequestLog {
             request_id,
@@ -495,9 +507,10 @@ impl<'a> UsageLogger<'a> {
             provider_type,
             is_streaming,
             cost_multiplier: cost_multiplier.to_string(),
+            credential_fingerprint,
         };
 
-        self.log_request(&log)
+        self.log_request(&log).map(|_| total_cost_usd)
     }
 }
 
@@ -530,6 +543,7 @@ mod tests {
             provider_type: Some("codex".to_string()),
             is_streaming: true,
             cost_multiplier: "1".to_string(),
+            credential_fingerprint: None,
         }
     }
 
@@ -574,6 +588,7 @@ mod tests {
             None,
             Some("claude".to_string()),
             false,
+            None,
         )?;
 
         // 验证记录已插入
@@ -788,6 +803,7 @@ mod tests {
             provider_type: Some("grokbuild".to_string()),
             is_streaming: false,
             cost_multiplier: "1".to_string(),
+            credential_fingerprint: None,
         };
 
         logger.log_request(&log)?;
@@ -799,6 +815,98 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(semantics, INPUT_TOKEN_SEMANTICS_TOTAL);
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprinted_usage_recorded_then_budget_blocks() -> Result<(), AppError> {
+        // Case 3（流式记账）+ Case 1 前半：streaming 请求完成后 usage 正常
+        // 落库且带 credential 指纹；随后 Budget Guard 按 SSOT 判定拦截。
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO model_pricing (model_id, display_name, input_cost_per_million, output_cost_per_million)
+                 VALUES ('test-model', 'Test Model', '3.0', '15.0')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let fingerprint =
+            crate::services::usage_limit::credential_fingerprint("claude", "sk-test-stream-key");
+        let logger = UsageLogger::new(&db);
+        let usage = TokenUsage {
+            input_tokens: 600,
+            output_tokens: 500,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: None,
+            message_id: None,
+        };
+        logger.log_with_calculation(
+            "req-stream-1".to_string(),
+            "provider-1".to_string(),
+            "claude".to_string(),
+            "test-model".to_string(),
+            "test-model".to_string(),
+            "test-model".to_string(),
+            usage,
+            Decimal::from(1),
+            100,
+            Some(20),
+            200,
+            None,
+            None,
+            true, // streaming：usage 在最终 chunk 后记账
+            Some(fingerprint.clone()),
+        )?;
+
+        // 指纹已随行落库
+        let stored: Option<String> = {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.query_row(
+                "SELECT credential_fingerprint FROM proxy_request_logs WHERE request_id = 'req-stream-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stored.as_deref(), Some(fingerprint.as_str()));
+
+        // Budget：limit 1000 tokens，已用 1100 → 下一请求被拒
+        // api_key_limits 有 FK → providers，先落 provider 行（key 与上面指纹一致）
+        db.save_provider(
+            "claude",
+            &crate::provider::Provider::with_id(
+                "provider-1".to_string(),
+                "Provider 1".to_string(),
+                serde_json::json!({
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://api.test.local",
+                        "ANTHROPIC_AUTH_TOKEN": "sk-test-stream-key",
+                    }
+                }),
+                None,
+            ),
+        )?;
+        db.upsert_api_key_limit(&crate::database::ApiKeyLimitRow {
+            provider_id: "provider-1".to_string(),
+            app_type: "claude".to_string(),
+            credential_fingerprint: fingerprint.clone(),
+            enabled: true,
+            limit_type: "token".to_string(),
+            currency: None,
+            limit_amount: "1000".to_string(),
+            usage_start_at: 0,
+            reset_interval_seconds: None,
+            created_at: 0,
+            updated_at: 0,
+        })?;
+        let rejection = db
+            .check_budget_before_forward("provider-1", "P", "claude", &fingerprint)
+            .expect_err("1100/1000 必须拦截");
+        assert!(rejection.message.contains("token limit reached"));
         Ok(())
     }
 }

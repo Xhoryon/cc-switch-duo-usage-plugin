@@ -13,7 +13,9 @@ use super::{
     usage::parser::TokenUsage,
     ProxyError,
 };
+use crate::database::Database;
 use crate::database::PRICING_SOURCE_REQUEST;
+use crate::services::usage_limit::{BudgetReservation, LimitType};
 use axum::http::{header::HeaderMap, HeaderName};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -147,6 +149,131 @@ pub fn is_sse_response(response: &ProxyResponse) -> bool {
     response.is_sse()
 }
 
+/// Best-effort live usage meter for streaming responses. Providers differ in
+/// whether usage appears on every event or only at the terminal event, so the
+/// meter is conservative: it keeps the greatest observed value for each
+/// dimension and commits the reservation conservatively if the stream ends
+/// without authoritative usage.
+pub(crate) struct StreamingBudgetMeter {
+    db: Arc<Database>,
+    reservation: Option<BudgetReservation>,
+    app_type: String,
+    observed: TokenUsage,
+}
+
+impl StreamingBudgetMeter {
+    pub(crate) fn new(db: Arc<Database>, reservation: BudgetReservation, app_type: &str) -> Self {
+        Self {
+            db,
+            reservation: Some(reservation),
+            app_type: app_type.to_string(),
+            observed: TokenUsage::default(),
+        }
+    }
+
+    fn observe_event(&mut self, event: &Value) -> bool {
+        let usage = event
+            .get("usage")
+            .and_then(|_| {
+                TokenUsage::from_claude_response(event)
+                    .or_else(|| TokenUsage::from_codex_response_auto(event))
+                    .or_else(|| TokenUsage::from_openai_response(event))
+            })
+            .or_else(|| {
+                event
+                    .get("usageMetadata")
+                    .and_then(|_| TokenUsage::from_gemini_response(event))
+            })
+            .or_else(|| {
+                event
+                    .get("response")
+                    .and_then(TokenUsage::from_codex_response_auto)
+            })
+            .or_else(|| {
+                event.get("message").and_then(|message| {
+                    message.get("usage").and_then(|usage| {
+                        TokenUsage::from_claude_response(&serde_json::json!({
+                            "usage": usage,
+                            "model": message.get("model"),
+                            "id": message.get("id"),
+                        }))
+                    })
+                })
+            });
+
+        let Some(usage) = usage else {
+            return false;
+        };
+        self.observed.input_tokens = self.observed.input_tokens.max(usage.input_tokens);
+        self.observed.output_tokens = self.observed.output_tokens.max(usage.output_tokens);
+        self.observed.cache_read_tokens =
+            self.observed.cache_read_tokens.max(usage.cache_read_tokens);
+        self.observed.cache_creation_tokens = self
+            .observed
+            .cache_creation_tokens
+            .max(usage.cache_creation_tokens);
+
+        match self.reservation.as_ref().map(|r| r.limit_type) {
+            Some(LimitType::Token) => {
+                self.observed
+                    .normalized_total_tokens_for_app(&self.app_type)
+                    > self
+                        .reservation
+                        .as_ref()
+                        .map(|r| r.reserved_tokens)
+                        .unwrap_or(i64::MAX)
+            }
+            Some(LimitType::Money) | None => false,
+        }
+    }
+
+    fn finish(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let observed_tokens = self
+            .observed
+            .normalized_total_tokens_for_app(&self.app_type);
+        let consumed_tokens = if observed_tokens > 0 {
+            observed_tokens
+        } else {
+            reservation.reserved_tokens
+        };
+        let consumed_cost = if reservation.limit_type == LimitType::Money {
+            reservation.reserved_cost_usd.clone()
+        } else {
+            "0".to_string()
+        };
+        if let Err(error) = self.db.reconcile_budget_reservation(
+            &reservation.request_id,
+            consumed_tokens,
+            &consumed_cost,
+        ) {
+            log::warn!(
+                "[Budget] streaming reservation 结算失败: request_id={}, error={error}",
+                reservation.request_id
+            );
+        }
+    }
+}
+
+impl Drop for StreamingBudgetMeter {
+    fn drop(&mut self) {
+        // A client disconnect or body cancellation must not leave a pending
+        // reservation forever. Commit observed/provisional usage conservatively.
+        self.finish();
+    }
+}
+
+pub(crate) fn create_streaming_budget_meter(
+    ctx: &RequestContext,
+    state: &ProxyState,
+) -> Option<StreamingBudgetMeter> {
+    ctx.budget_reservation.clone().map(|reservation| {
+        StreamingBudgetMeter::new(state.db.clone(), reservation, ctx.app_type_str)
+    })
+}
+
 /// 处理流式响应
 pub async fn handle_streaming(
     response: ProxyResponse,
@@ -197,6 +324,7 @@ pub async fn handle_streaming(
         usage_collector,
         timeout_config,
         connection_guard,
+        create_streaming_budget_meter(ctx, state),
     );
 
     let body = axum::body::Body::from_stream(logged_stream);
@@ -305,6 +433,7 @@ pub async fn handle_non_streaming(
         }
     } else {
         log::debug!("[{}] usage logging 已关闭，跳过非流式 usage 解析", ctx.tag);
+        finalize_budget_reservation_without_logging(ctx, state);
     }
 
     // 构建响应
@@ -494,6 +623,11 @@ pub(crate) fn create_usage_collector(
     let stream_parser = parser_config.stream_parser;
     let model_extractor = parser_config.model_extractor;
     let session_id = ctx.session_id.clone();
+    let credential_fingerprint = ctx.credential_fingerprint.clone();
+    let budget_reservation_id = ctx
+        .budget_reservation
+        .as_ref()
+        .map(|reservation| reservation.request_id.clone());
 
     Some(SseUsageCollector::new(
         start_time,
@@ -506,6 +640,8 @@ pub(crate) fn create_usage_collector(
                 let state = state.clone();
                 let provider_id = provider_id.clone();
                 let session_id = session_id.clone();
+                let credential_fingerprint = credential_fingerprint.clone();
+                let budget_reservation_id = budget_reservation_id.clone();
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
 
@@ -523,6 +659,8 @@ pub(crate) fn create_usage_collector(
                         true, // is_streaming
                         status_code,
                         Some(session_id),
+                        credential_fingerprint,
+                        budget_reservation_id,
                     )
                     .await;
                 });
@@ -532,6 +670,8 @@ pub(crate) fn create_usage_collector(
                 let state = state.clone();
                 let provider_id = provider_id.clone();
                 let session_id = session_id.clone();
+                let credential_fingerprint = credential_fingerprint.clone();
+                let budget_reservation_id = budget_reservation_id.clone();
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
 
@@ -549,6 +689,8 @@ pub(crate) fn create_usage_collector(
                         true, // is_streaming
                         status_code,
                         Some(session_id),
+                        credential_fingerprint,
+                        budget_reservation_id,
                     )
                     .await;
                 });
@@ -587,6 +729,11 @@ fn spawn_log_usage(
         .unwrap_or_else(|| ctx.request_model.clone());
     let latency_ms = ctx.latency_ms();
     let session_id = ctx.session_id.clone();
+    let credential_fingerprint = ctx.credential_fingerprint.clone();
+    let budget_reservation_id = ctx
+        .budget_reservation
+        .as_ref()
+        .map(|reservation| reservation.request_id.clone());
 
     tokio::spawn(async move {
         log_usage_internal(
@@ -602,6 +749,8 @@ fn spawn_log_usage(
             is_streaming,
             status_code,
             Some(session_id),
+            credential_fingerprint,
+            budget_reservation_id,
         )
         .await;
     });
@@ -613,6 +762,40 @@ pub(crate) fn usage_logging_enabled(state: &ProxyState) -> bool {
         .try_read()
         .map(|config| config.enable_logging)
         .unwrap_or(true)
+}
+
+/// Finalize a request reservation when usage logging is disabled.
+///
+/// The proxy still enforces the budget gate even when the historical usage
+/// ledger is disabled. Without a terminal state, a successful request would
+/// leave its reservation pending until TTL cleanup and could create a local
+/// budget bypass under concurrency. Since no provider usage is available in
+/// this mode, commit the provisional reservation conservatively.
+pub(crate) fn finalize_budget_reservation_without_logging(
+    ctx: &RequestContext,
+    state: &ProxyState,
+) {
+    if usage_logging_enabled(state) {
+        return;
+    }
+    let Some(reservation) = ctx.budget_reservation.as_ref() else {
+        return;
+    };
+    let consumed_cost = if reservation.limit_type == LimitType::Money {
+        reservation.reserved_cost_usd.as_str()
+    } else {
+        "0"
+    };
+    if let Err(error) = state.db.reconcile_budget_reservation(
+        &reservation.request_id,
+        reservation.reserved_tokens,
+        consumed_cost,
+    ) {
+        log::warn!(
+            "[Budget] 未启用 usage logging 时结算 reservation 失败: request_id={}, error={error}",
+            reservation.request_id
+        );
+    }
 }
 
 /// 内部使用量记录函数
@@ -635,6 +818,8 @@ async fn log_usage_internal(
     is_streaming: bool,
     status_code: u16,
     session_id: Option<String>,
+    credential_fingerprint: Option<String>,
+    budget_reservation_id: Option<String>,
 ) {
     use super::usage::logger::UsageLogger;
 
@@ -659,7 +844,8 @@ async fn log_usage_internal(
         usage.cache_creation_tokens
     );
 
-    if let Err(e) = logger.log_with_calculation(
+    let consumed_tokens = usage.normalized_total_tokens_for_app(app_type);
+    match logger.log_with_calculation(
         request_id,
         provider_id.to_string(),
         app_type.to_string(),
@@ -674,8 +860,22 @@ async fn log_usage_internal(
         session_id,
         None, // provider_type
         is_streaming,
+        credential_fingerprint,
     ) {
-        log::warn!("[USG-001] 记录使用量失败: {e}");
+        Ok(consumed_cost_usd) => {
+            if let Some(reservation_id) = budget_reservation_id {
+                if let Err(error) = state.db.reconcile_budget_reservation(
+                    &reservation_id,
+                    consumed_tokens,
+                    &consumed_cost_usd.normalize().to_string(),
+                ) {
+                    log::warn!(
+                        "[Budget] usage 结算 reservation 失败: request_id={reservation_id}, error={error}"
+                    );
+                }
+            }
+        }
+        Err(error) => log::warn!("[USG-001] 记录使用量失败: {error}"),
     }
 }
 
@@ -686,15 +886,19 @@ pub fn create_logged_passthrough_stream(
     usage_collector: Option<SseUsageCollector>,
     timeout_config: StreamingTimeoutConfig,
     connection_guard: Option<ActiveConnectionGuard>,
+    streaming_budget_meter: Option<StreamingBudgetMeter>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let _conn_guard = connection_guard;
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut collector = usage_collector;
+        let mut budget_meter = streaming_budget_meter;
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
         let inspect_sse_events =
-            collector.is_some() || log::log_enabled!(log::Level::Debug);
+            collector.is_some()
+                || budget_meter.is_some()
+                || log::log_enabled!(log::Level::Debug);
         let mut is_first_chunk = true;
 
         // 超时配置
@@ -747,6 +951,7 @@ pub fn create_logged_passthrough_stream(
                     is_first_chunk = false;
                     if inspect_sse_events {
                         crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                        let mut budget_cutoff = false;
 
                         // 尝试解析并记录完整的 SSE 事件
                         while let Some(event_text) = take_sse_block(&mut buffer) {
@@ -757,26 +962,53 @@ pub fn create_logged_passthrough_stream(
                                         if data.trim() != "[DONE]" {
                                             let collected = match &collector {
                                                 Some(c) if c.should_collect(data) => {
-                                                    match serde_json::from_str::<Value>(data) {
+                                                match serde_json::from_str::<Value>(data) {
                                                         Ok(json_value) => {
+                                                            if let Some(meter) = &mut budget_meter {
+                                                                budget_cutoff = meter.observe_event(&json_value);
+                                                            }
                                                             c.push(json_value).await;
                                                             true
                                                         }
                                                         Err(_) => false,
                                                     }
                                                 }
-                                                _ => false,
+                                                _ => match serde_json::from_str::<Value>(data) {
+                                                    Ok(json_value) => {
+                                                        if let Some(meter) = &mut budget_meter {
+                                                            budget_cutoff = meter.observe_event(&json_value);
+                                                        }
+                                                        true
+                                                    }
+                                                    Err(_) => false,
+                                                },
                                             };
                                             log::trace!(
                                                 "[{tag}] <<< SSE data: bytes={}, usage_collected={collected} (content omitted)",
                                                 data.len()
                                             );
+                                            if budget_cutoff {
+                                                break;
+                                            }
                                         } else {
                                             log::debug!("[{tag}] <<< SSE: [DONE]");
                                         }
                                     }
                                 }
                             }
+                            if budget_cutoff {
+                                break;
+                            }
+                        }
+                        if budget_cutoff {
+                            let terminal = Bytes::from(
+                                "event: error\ndata: {\"type\":\"cc_switch_usage_limit\",\"code\":\"API_KEY_LIMIT_REACHED\",\"message\":\"CC Switch usage limit reached\"}\n\n",
+                            );
+                            yield Ok(terminal);
+                            if let Some(meter) = &mut budget_meter {
+                                meter.finish();
+                            }
+                            break;
                         }
                     }
 
@@ -796,6 +1028,9 @@ pub fn create_logged_passthrough_stream(
 
         if let Some(c) = collector.take() {
             c.finish().await;
+        }
+        if let Some(meter) = &mut budget_meter {
+            meter.finish();
         }
         if let Some(guard) = &mut finish_guard {
             guard.disarm();
@@ -932,6 +1167,87 @@ mod tests {
             Some("message_start")
         );
         assert_eq!(super::strip_sse_field("id:1", "data"), None);
+    }
+
+    #[tokio::test]
+    async fn streaming_budget_meter_stops_at_safe_sse_boundary() {
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_provider(
+            "claude",
+            &crate::provider::Provider::with_id(
+                "provider-stream".to_string(),
+                "Stream Provider".to_string(),
+                serde_json::json!({"env": {"ANTHROPIC_AUTH_TOKEN": "sk-stream-test"}}),
+                None,
+            ),
+        )
+        .unwrap();
+        let reservation = crate::services::usage_limit::BudgetReservation {
+            request_id: "stream-cutoff".to_string(),
+            provider_id: "provider-stream".to_string(),
+            app_type: "claude".to_string(),
+            credential_fingerprint: "fingerprint-stream".to_string(),
+            limit_type: crate::services::usage_limit::LimitType::Token,
+            reserved_tokens: 10,
+            reserved_cost_usd: "0".to_string(),
+            expires_at: i64::MAX,
+        };
+        db.insert_pending_budget_reservation(&crate::database::BudgetReservationRow {
+            request_id: reservation.request_id.clone(),
+            provider_id: reservation.provider_id.clone(),
+            app_type: reservation.app_type.clone(),
+            credential_fingerprint: reservation.credential_fingerprint.clone(),
+            limit_type: "token".to_string(),
+            reserved_tokens: 10,
+            reserved_cost_usd: "0".to_string(),
+            consumed_tokens: 0,
+            consumed_cost_usd: "0".to_string(),
+            status: "pending".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            expires_at: i64::MAX,
+        })
+        .unwrap();
+
+        let input = futures::stream::iter(vec![
+            Ok(Bytes::from(
+                "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":8,\"output_tokens\":4}}\n\n",
+            )),
+            Ok(Bytes::from("data: {\"type\":\"content_block_delta\"}\n\n")),
+        ]);
+        let output = create_logged_passthrough_stream(
+            input,
+            "test",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            Some(StreamingBudgetMeter::new(db.clone(), reservation, "claude")),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(
+            output.len(),
+            1,
+            "the post-limit event must not pass through"
+        );
+        let body = output[0].as_ref().unwrap();
+        assert!(body.starts_with(b"event: error"));
+        assert!(body
+            .windows(b"API_KEY_LIMIT_REACHED".len())
+            .any(|window| { window == b"API_KEY_LIMIT_REACHED" }));
+        let conn = db.conn.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM budget_reservations WHERE request_id = 'stream-cutoff'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "committed");
     }
 
     #[test]
@@ -1107,6 +1423,8 @@ mod tests {
             false,
             200,
             None,
+            None,
+            None,
         )
         .await;
 
@@ -1176,6 +1494,8 @@ mod tests {
             None,
             false,
             200,
+            None,
+            None,
             None,
         )
         .await;
@@ -1256,6 +1576,8 @@ mod tests {
             None,
             false,
             200,
+            None,
+            None,
             None,
         )
         .await;

@@ -375,8 +375,8 @@ Run: `pnpm exec vitest run tests/components/UsageLimitDialog.test.tsx && pnpm ty
 
 **Files:**
 - Modify: `docs/development_log.md`
-- Modify: `/Users/jiayihuang/Downloads/CC Switch Duo Usage Plugin/工作日志.md`
-- Modify: `/Users/jiayihuang/Downloads/CC Switch Duo Usage Plugin/知识库.md`
+- Modify: local working notes outside this repository (not published)
+- Modify: local knowledge base outside this repository (not published)
 - Modify: verification result files only through the existing scripts
 
 - [x] **Step 1: Record the complete implementation**

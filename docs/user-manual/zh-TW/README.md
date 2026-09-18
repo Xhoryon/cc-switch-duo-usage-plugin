@@ -1,6 +1,6 @@
 # CC Switch 使用者手冊（Usage Plugin 補充）
 
-> 本頁提供 CC Switch Usage Plugin v1.0.1 的繁體中文使用說明；宿主應用程式版本為 CC Switch 3.20.3。
+> 本頁提供 CC Switch Duo Usage Plugin v1.0.1 的繁體中文使用說明；宿主應用程式版本為 CC Switch 3.20.3。
 
 ## 安裝
 

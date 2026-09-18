@@ -1,8 +1,8 @@
 <div align="center">
 
-# CC Switch Usage Plugin
+# CC Switch Duo Usage Plugin
 
-### Add per-API-Key usage limits (budget) to CC Switch — enforced by the local proxy
+### A small, local-only budget guard for [CC Switch](https://github.com/farion1231/cc-switch)
 
 **Plugin release:** v1.0.1 · **Host application:** CC Switch 3.20.3
 
@@ -18,8 +18,9 @@
 
 ## What is this?
 
-**CC Switch Usage Plugin** extends the open-source provider switcher
-[CC Switch](https://github.com/farion1231/cc-switch) with a budget feature:
+**CC Switch Duo Usage Plugin** is a small, local-only extension for the open-source
+provider switcher [CC Switch](https://github.com/farion1231/cc-switch). It adds a
+budget feature:
 every API Key can get a **usage cap** — a money amount (USD / CNY) or a token
 count. Once the cap is reached, the CC Switch local proxy **rejects new
 requests** with a clear error instead of just tracking usage.

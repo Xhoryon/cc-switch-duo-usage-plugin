@@ -1,5 +1,6 @@
 {
   "name": "ccswitch-usage-plugin",
+  "displayName": "CC Switch Duo Usage Plugin",
   "version": "1.0.1",
   "releaseTag": "v1.0.1",
   "hostApplication": "CC Switch",

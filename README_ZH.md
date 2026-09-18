@@ -1,8 +1,8 @@
 <div align="center">
 
-# CC Switch Usage Plugin
+# CC Switch Duo Usage Plugin
 
-### 为 CC Switch 增加按 API Key 的使用限额（预算）——由本地代理强制执行
+### 为开源的 [CC Switch](https://github.com/farion1231/cc-switch) 增加本地预算守卫
 
 **插件版本：** v1.0.1 · **宿主应用：** CC Switch 3.20.3
 
@@ -18,8 +18,8 @@
 
 ## 这是什么？
 
-**CC Switch Usage Plugin** 在开源供应商切换工具
-[CC Switch](https://github.com/farion1231/cc-switch) 的基础上增加了预算功能：
+**CC Switch Duo Usage Plugin** 是为开源供应商切换工具
+[CC Switch](https://github.com/farion1231/cc-switch) 提供的轻量、本地扩展。它增加了预算功能：
 每个 API Key 都可以设置**使用上限**——金额（USD / CNY）或 Token 数量。达到上限后，
 CC Switch 本地代理会**直接拒绝新的请求**并返回明确错误，而不是只做统计。
 

@@ -1,8 +1,8 @@
 <div align="center">
 
-# CC Switch Usage Plugin
+# CC Switch Duo Usage Plugin
 
-### CC Switch に API Key ごとの使用制限（バジェット）を追加 — ローカルプロキシが強制します
+### オープンソースの [CC Switch](https://github.com/farion1231/cc-switch) にローカル予算ガードを追加
 
 **プラグインバージョン:** v1.0.1 · **ホストアプリ:** CC Switch 3.20.3
 
@@ -18,8 +18,9 @@
 
 ## これは何？
 
-**CC Switch Usage Plugin** は、オープンソースのプロバイダ切り替えツール
-[CC Switch](https://github.com/farion1231/cc-switch) にバジェット機能を追加したものです。
+**CC Switch Duo Usage Plugin** は、オープンソースのプロバイダ切り替えツール
+[CC Switch](https://github.com/farion1231/cc-switch) のための軽量なローカル拡張です。
+バジェット機能を追加し、
 すべての API Key に**使用上限** — 金額（USD / CNY）またはトークン数 — を設定でき、
 上限に達すると CC Switch のローカルプロキシが新しいリクエストを明確なエラーで
 **拒否します**。統計だけの「見かけの制限」ではありません。

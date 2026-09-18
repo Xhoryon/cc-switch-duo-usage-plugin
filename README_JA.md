@@ -4,7 +4,7 @@
 
 ### オープンソースの [CC Switch](https://github.com/farion1231/cc-switch) にローカル予算ガードを追加
 
-**プラグインバージョン:** v1.0.1 · **ホストアプリ:** CC Switch 3.20.3
+**プラグインバージョン:** v1.0.2 · **ホストアプリ:** CC Switch 3.20.3
 
 [![Release](https://img.shields.io/github/v/release/Xhoryon/ccswitch-usage-plugin?color=blue&label=release)](https://github.com/Xhoryon/ccswitch-usage-plugin/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg)](https://github.com/Xhoryon/ccswitch-usage-plugin/releases)
@@ -50,7 +50,7 @@
 ## インストール
 
 1. [Releases](https://github.com/Xhoryon/ccswitch-usage-plugin/releases) ページから
-   `CC-Switch-3.20.3-Usage-Plugin-v1.0.1-macOS-arm64.dmg`（macOS、Apple Silicon）をダウンロード。
+   `CC-Switch-3.20.3-Usage-Plugin-v1.0.2-macOS-arm64.dmg`（macOS、Apple Silicon）をダウンロード。
 2. DMG をマウントし、**CC Switch.app** をアプリケーションにドラッグします。
 
 ## クイックスタート
@@ -74,13 +74,13 @@
 
 ## リリースノート
 
-- [v1.0.1 — English](docs/release-notes/v1.0.1-en.md)
-- [v1.0.1 — 简体中文](docs/release-notes/v1.0.1-zh.md)
-- [v1.0.1 — 繁體中文](docs/release-notes/v1.0.1-zh-TW.md)
-- [v1.0.1 — 日本語](docs/release-notes/v1.0.1-ja.md)
+- [v1.0.2 — English](docs/release-notes/v1.0.2-en.md)
+- [v1.0.2 — 简体中文](docs/release-notes/v1.0.2-zh.md)
+- [v1.0.2 — 繁體中文](docs/release-notes/v1.0.2-zh-TW.md)
+- [v1.0.2 — 日本語](docs/release-notes/v1.0.2-ja.md)
 
 本リリースは署名なしの macOS Apple Silicon ビルドです。アプリのバージョンは CC Switch
-3.20.3 のままで、v1.0.1 は Usage Plugin のリリースバージョンです。
+3.20.3 のままで、v1.0.2 は Usage Plugin のリリースバージョンです。
 
 ## ソースからビルド
 
@@ -103,4 +103,4 @@ pnpm build        # 利用可能な Rust ツールチェーン（stable）が必
 
 ## ライセンス
 
-[MIT](LICENSE) © 2026 Jiayi Huang — オリジナル CC Switch の MIT 表示を含みます。
+[MIT](LICENSE) © 2026 CC Switch Duo contributors — オリジナル CC Switch の MIT 表示を含みます。

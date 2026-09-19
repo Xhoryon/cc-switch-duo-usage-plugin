@@ -1,8 +1,8 @@
 {
   "name": "ccswitch-usage-plugin",
   "displayName": "CC Switch Duo Usage Plugin",
-  "version": "1.0.1",
-  "releaseTag": "v1.0.1",
+  "version": "1.0.2",
+  "releaseTag": "v1.0.2",
   "hostApplication": "CC Switch",
   "hostVersion": "3.20.3",
   "platform": "macOS Apple Silicon",

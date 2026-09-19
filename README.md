@@ -4,7 +4,7 @@
 
 ### A small, local-only budget guard for [CC Switch](https://github.com/farion1231/cc-switch)
 
-**Plugin release:** v1.0.1 · **Host application:** CC Switch 3.20.3
+**Plugin release:** v1.0.2 · **Host application:** CC Switch 3.20.3
 
 [![Release](https://img.shields.io/github/v/release/Xhoryon/ccswitch-usage-plugin?color=blue&label=release)](https://github.com/Xhoryon/ccswitch-usage-plugin/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg)](https://github.com/Xhoryon/ccswitch-usage-plugin/releases)
@@ -51,7 +51,7 @@ requests** with a clear error instead of just tracking usage.
 
 ## Install
 
-1. Grab `CC-Switch-3.20.3-Usage-Plugin-v1.0.1-macOS-arm64.dmg` from the
+1. Grab `CC-Switch-3.20.3-Usage-Plugin-v1.0.2-macOS-arm64.dmg` from the
    [Releases](https://github.com/Xhoryon/ccswitch-usage-plugin/releases) page
    (macOS, Apple Silicon).
 2. Mount the DMG and drag **CC Switch.app** into Applications.
@@ -79,13 +79,13 @@ requests** with a clear error instead of just tracking usage.
 
 ## Release notes
 
-- [v1.0.1 — English](docs/release-notes/v1.0.1-en.md)
-- [v1.0.1 — 简体中文](docs/release-notes/v1.0.1-zh.md)
-- [v1.0.1 — 繁體中文](docs/release-notes/v1.0.1-zh-TW.md)
-- [v1.0.1 — 日本語](docs/release-notes/v1.0.1-ja.md)
+- [v1.0.2 — English](docs/release-notes/v1.0.2-en.md)
+- [v1.0.2 — 简体中文](docs/release-notes/v1.0.2-zh.md)
+- [v1.0.2 — 繁體中文](docs/release-notes/v1.0.2-zh-TW.md)
+- [v1.0.2 — 日本語](docs/release-notes/v1.0.2-ja.md)
 
 This release is an unsigned macOS Apple Silicon build. The app version remains
-CC Switch 3.20.3; v1.0.1 is the Usage Plugin release version.
+CC Switch 3.20.3; v1.0.2 is the Usage Plugin release version.
 
 ## Build from source
 
@@ -110,5 +110,5 @@ The usage limit feature itself was developed in this repository.
 
 ## License
 
-[MIT](LICENSE) © 2026 Jiayi Huang — includes the original CC Switch MIT
+[MIT](LICENSE) © 2026 CC Switch Duo contributors — includes the original CC Switch MIT
 notice.

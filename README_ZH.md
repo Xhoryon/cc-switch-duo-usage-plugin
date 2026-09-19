@@ -4,7 +4,7 @@
 
 ### 为开源的 [CC Switch](https://github.com/farion1231/cc-switch) 增加本地预算守卫
 
-**插件版本：** v1.0.1 · **宿主应用：** CC Switch 3.20.3
+**插件版本：** v1.0.2 · **宿主应用：** CC Switch 3.20.3
 
 [![Release](https://img.shields.io/github/v/release/Xhoryon/ccswitch-usage-plugin?color=blue&label=release)](https://github.com/Xhoryon/ccswitch-usage-plugin/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg)](https://github.com/Xhoryon/ccswitch-usage-plugin/releases)
@@ -42,7 +42,7 @@ CC Switch 本地代理会**直接拒绝新的请求**并返回明确错误，而
 ## 下载安装
 
 1. 从 [Releases](https://github.com/Xhoryon/ccswitch-usage-plugin/releases) 页面下载
-   `CC-Switch-3.20.3-Usage-Plugin-v1.0.1-macOS-arm64.dmg`（macOS，Apple Silicon）。
+   `CC-Switch-3.20.3-Usage-Plugin-v1.0.2-macOS-arm64.dmg`（macOS，Apple Silicon）。
 2. 挂载 DMG，将 **CC Switch.app** 拖入"应用程序"。
 
 ## 快速上手
@@ -64,13 +64,13 @@ CC Switch 本地代理会**直接拒绝新的请求**并返回明确错误，而
 
 ## Release 说明
 
-- [v1.0.1 — English](docs/release-notes/v1.0.1-en.md)
-- [v1.0.1 — 简体中文](docs/release-notes/v1.0.1-zh.md)
-- [v1.0.1 — 繁體中文](docs/release-notes/v1.0.1-zh-TW.md)
-- [v1.0.1 — 日本語](docs/release-notes/v1.0.1-ja.md)
+- [v1.0.2 — English](docs/release-notes/v1.0.2-en.md)
+- [v1.0.2 — 简体中文](docs/release-notes/v1.0.2-zh.md)
+- [v1.0.2 — 繁體中文](docs/release-notes/v1.0.2-zh-TW.md)
+- [v1.0.2 — 日本語](docs/release-notes/v1.0.2-ja.md)
 
 本版本是未签名的 macOS Apple Silicon 构建。应用版本仍为 CC Switch 3.20.3，
-v1.0.1 是 Usage Plugin 的版本号。
+v1.0.2 是 Usage Plugin 的版本号。
 
 ## 从源码构建
 
@@ -92,4 +92,4 @@ Claude Code / Codex / Gemini CLI 全能管理工具。底层的切换、代理�
 
 ## 许可证
 
-[MIT](LICENSE) © 2026 Jiayi Huang —— 含原 CC Switch 的 MIT 声明。
+[MIT](LICENSE) © 2026 CC Switch Duo contributors —— 含原 CC Switch 的 MIT 声明。
